@@ -77,6 +77,14 @@ export class CopyCounter {
     this.ring = [];
     this.counts.clear();
   }
+  /** Saved before a batch and put back when it fails, so a retried entry keeps its copy number (and _id). */
+  snapshot() {
+    return { ring: this.ring.slice(), counts: new Map(this.counts) };
+  }
+  restore(saved) {
+    this.ring = saved.ring;
+    this.counts = saved.counts;
+  }
 }
 
 /**
@@ -318,10 +326,12 @@ async function pass(redis) {
 
   let entries = await readBatch(redis);
   while (true) {
+    const saved = copies.snapshot();
     try {
       await shipBatch(entries, state.offset);
       break;
     } catch (err) {
+      copies.restore(saved);
       if (!err.split) throw err;
       entries = entries.slice(0, Math.max(1, Math.floor(entries.length / 2)));
     }
@@ -436,6 +446,42 @@ export function statusSnapshot() {
   };
 }
 
+/**
+ * Exact check: every entry now in the Redis list has its document in OpenSearch, once. Reads the list in
+ * chunks and keeps only ids, so memory stays small however long the list is.
+ * Documents not in the list are history (Redis trimmed or flushed) — or duplicates, which `sample` shows.
+ */
+async function parity() {
+  const redis = new Redis({ host: config.redisHost, port: config.redisPort, db: config.redisDb, maxRetriesPerRequest: 2 });
+  try {
+    const expected = new Set();
+    const counter = new CopyCounter(config.dupWindow);
+    const length = await redis.llen(config.listKey);
+    for (let start = 0; start < length; start += 5000) {
+      const chunk = await redis.lrange(config.listKey, start, Math.min(length, start + 5000) - 1);
+      for (const raw of chunk) expected.add(docId(raw, counter.next(raw)));
+    }
+    let missing = expected.size;
+    let extra = 0;
+    const sample = [];
+    let res = await os('POST', `/${config.indexPrefix}*/_search?scroll=1m`, JSON.stringify({ size: 10000, _source: ['ts', 'e_event', 'e_id'], sort: ['_doc'] }));
+    while (res.json && res.json.hits && res.json.hits.hits.length) {
+      for (const h of res.json.hits.hits) {
+        if (expected.has(h._id)) missing -= 1;
+        else {
+          extra += 1;
+          if (sample.length < 5) sample.push({ _id: h._id, _index: h._index, ...h._source });
+        }
+      }
+      res = await os('POST', '/_search/scroll', JSON.stringify({ scroll: '1m', scroll_id: res.json._scroll_id }));
+    }
+    if (res.json && res.json._scroll_id) await os('DELETE', '/_search/scroll', JSON.stringify({ scroll_id: res.json._scroll_id }));
+    return { redis_entries: length, missing_in_opensearch: missing, not_in_redis: extra, sample_not_in_redis: sample };
+  } finally {
+    redis.disconnect();
+  }
+}
+
 async function indexStats() {
   const res = await os('GET', `/_cat/indices/${config.indexPrefix}*,${config.rejectIndex}?format=json&bytes=b&h=index,health,docs.count,store.size`);
   if (res.status !== 200 || !Array.isArray(res.json)) throw new Error(`OpenSearch ${res.status}`);
@@ -462,6 +508,10 @@ function startStatusServer() {
         }
         if (url.pathname === '/api/indices') {
           sendJson(res, 200, await indexStats());
+          return;
+        }
+        if (url.pathname === '/api/parity') {
+          sendJson(res, 200, await parity());
           return;
         }
         if (url.pathname === '/api/lookups') {

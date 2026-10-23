@@ -1,4 +1,5 @@
 // ASTRA Local OpenSearch — one command for everything (see README.md):
+//   npm run setup              first-time setup in one go: checks the laptop, starts it, connects MNG, tests it
 //   npm run up                 start (or update) OpenSearch, Dashboards and the log shipper; set up Dashboards
 //   npm run status             is everything running, how much is shipped, is MNG wired
 //   npm run doctor             end-to-end proof: Redis → OpenSearch → the product's own query, inside MNG
@@ -19,7 +20,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dotenv = readDotEnv(path.join(ROOT, '.env'));
 const setting = (key, fallback) => process.env[key] || dotenv[key] || fallback;
 
-const ASTRA_REPO = setting('ASTRA_REPO', path.join(os.homedir(), 'payment_system'));
+// Cloned inside payment_system (next to qa-astra)? Then that is the checkout; otherwise ~/payment_system.
+const insideAstra = fs.existsSync(path.join(ROOT, '..', 'mng', 'app', 'api')) ? path.resolve(ROOT, '..') : null;
+const ASTRA_REPO = setting('ASTRA_REPO', insideAstra || path.join(os.homedir(), 'payment_system'));
 const OS_PORT = setting('OPENSEARCH_PORT', '9200');
 const DASH_PORT = setting('DASHBOARDS_PORT', '5601');
 const SHIP_PORT = setting('SHIPPER_PORT', '9700');
@@ -275,9 +278,7 @@ async function prepareOpenSearchBuild() {
   }
 
   if (!fs.existsSync(path.join(jdkDir, 'bin', 'java'))) {
-    const jvmDirs = fs.existsSync('/usr/lib/jvm') ? fs.readdirSync('/usr/lib/jvm').map((d) => path.join('/usr/lib/jvm', d)) : [];
-    const candidates = [process.env.JAVA_HOME, ...jvmDirs.filter((d) => /(^|[-.])21([-.]|$)/.test(path.basename(d))), ...jvmDirs.filter((d) => /(^|[-.])17([-.]|$)/.test(path.basename(d)))].filter(Boolean);
-    const jdk = candidates.find((d) => fs.existsSync(path.join(d, 'bin', 'java')) && !fs.lstatSync(d).isSymbolicLink());
+    const jdk = findJava();
     if (!jdk) {
       fail('No Java 17 or 21 found on this computer. Install it (sudo apt install openjdk-17-jre-headless), set JAVA_HOME, or load the ready-made image instead (see SETUP.md, "If Java will not install").');
     }
@@ -288,6 +289,14 @@ async function prepareOpenSearchBuild() {
   }
 }
 
+/** A Java 21 or 17 installed on this computer (JAVA_HOME first), or null. */
+function findJava() {
+  const jvmDirs = fs.existsSync('/usr/lib/jvm') ? fs.readdirSync('/usr/lib/jvm').map((d) => path.join('/usr/lib/jvm', d)) : [];
+  const byVersion = (v) => jvmDirs.filter((d) => new RegExp(`(^|[-.])${v}([-.]|$)`).test(path.basename(d)));
+  const candidates = [process.env.JAVA_HOME, ...byVersion(21), ...byVersion(17)].filter(Boolean);
+  return candidates.find((d) => fs.existsSync(path.join(d, 'bin', 'java')) && !fs.lstatSync(d).isSymbolicLink()) || null;
+}
+
 function sha512File(file) {
   try {
     return crypto.createHash('sha512').update(fs.readFileSync(file)).digest('hex');
@@ -296,7 +305,7 @@ function sha512File(file) {
   }
 }
 
-async function up() {
+async function up({ fromSetup = false } = {}) {
   console.log('Starting ASTRA Local OpenSearch\n');
   if (run('docker', ['info', '--format', '{{.ServerVersion}}']).status !== 0) fail('Docker is not running.');
   if (run('docker', ['network', 'inspect', 'nps_default']).status !== 0) {
@@ -363,7 +372,7 @@ async function up() {
     ok('Dashboards set up: index pattern nps-app-*, saved searches for every MNG trace screen');
   } else warn('Dashboards is still starting; run `npm run up` again in a minute to finish setting it up.');
 
-  await status({ short: true });
+  await status({ short: true, hideWiring: fromSetup });
 }
 
 function down() {
@@ -374,7 +383,7 @@ function down() {
   if (wired.length) console.log(`Note: ${wired.map((s) => s.app).join(' and ')} still point at the local OpenSearch; trace screens will error until it is up (or run: npm run unwire).`);
 }
 
-async function status({ short = false } = {}) {
+async function status({ short = false, hideWiring = false } = {}) {
   console.log('\nASTRA Local OpenSearch\n');
   for (const c of CONTAINERS) {
     const st = containerState(c);
@@ -394,7 +403,7 @@ async function status({ short = false } = {}) {
   } else bad(`Shipper status page not reachable at ${SHIP}`);
 
   console.log('');
-  for (const { app } of APPS) {
+  for (const { app } of hideWiring ? [] : APPS) {
     const w = wiringState(app);
     if (!w.exists) warn(`${app}: config.json not found`);
     else if (w.wired) ok(`${app}: wired → reads traces from this local OpenSearch`);
@@ -537,6 +546,19 @@ async function doctor() {
     }
     check(found === checked, `${found}/${checked} entries sampled from Redis (oldest, newest, random) are in OpenSearch`, `only ${found}/${checked} sampled entries found in OpenSearch`);
   }
+  // Exact: every entry in the list has exactly its own document (retried once, in case new entries were in flight).
+  let par = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    par = (await tryJson(`${SHIP}/api/parity`, { timeout: 180_000 }))?.json;
+    if (!par || par.missing_in_opensearch === 0) break;
+    await sleep(2000);
+  }
+  check(
+    par && par.missing_in_opensearch === 0,
+    `exact check: all ${fmt(par?.redis_entries)} Redis entries are in OpenSearch, each once`,
+    par ? `${fmt(par.missing_in_opensearch)} Redis entries are not in OpenSearch` : 'exact check could not run (shipper not reachable)',
+  );
+  if (par?.not_in_redis) warn(`${fmt(par.not_in_redis)} documents are no longer in the Redis list (kept history after Redis was trimmed or flushed, or a duplicate): ${SHIP}/api/parity`);
 
   console.log('\nMNG / WL-MNG');
   // a recent transaction with trace rows, to compare both query paths on
@@ -574,12 +596,103 @@ async function doctor() {
 
   console.log(problems ? `\n✗ ${problems} problem(s) found.` : '\n✓ All good: local traces work end to end.');
   process.exitCode = problems ? 1 : 0;
+  return problems;
+}
+
+// ---------- setup: the whole first-time setup in one command ----------
+
+/** Everything this laptop needs, as plain-English checks with the fix for each one that fails. */
+function setupChecks() {
+  const checks = [];
+  const add = (pass, label, fix) => checks.push({ pass, label, fix });
+  const dockerOk = run('docker', ['info', '--format', '{{.ServerVersion}}']).status === 0;
+  add(dockerOk, 'Docker is running', 'Start Docker (sudo systemctl start docker), or install Docker Engine.');
+  add(dockerOk && run('docker', ['compose', 'version']).status === 0, 'Docker Compose is installed', 'Install the Docker Compose plugin (sudo apt install docker-compose-plugin).');
+  add(Number(process.versions.node.split('.')[0]) >= 20, `Node 20 or newer (you have ${process.version})`, 'Install Node 20 or newer (for example with nvm: nvm install 20).');
+  const astraUp = dockerOk && ['nps_redis', 'nps_admin_web', 'nps_wl-mng_web'].every((c) => containerState(c).startsWith('running'));
+  add(astraUp, 'Your local ASTRA stack is running', 'Start your local ASTRA stack first (docker ps must list nps_redis, nps_admin_web and nps_wl-mng_web).');
+  add(
+    fs.existsSync(path.join(ASTRA_REPO, 'mng', 'app', 'api')),
+    `Your payment_system folder is found (${ASTRA_REPO})`,
+    'Tell it where payment_system is: echo "ASTRA_REPO=/path/to/payment_system" > .env',
+  );
+  const image = `astra-opensearch:${setting('OPENSEARCH_VERSION', '2.19.6')}-local`;
+  const haveImage = dockerOk && run('docker', ['image', 'inspect', image]).status === 0;
+  const haveBuild = fs.existsSync(path.join(ROOT, 'opensearch', 'build', 'jdk', 'bin', 'java'));
+  const java = findJava();
+  add(
+    haveImage || haveBuild || Boolean(java),
+    haveImage ? 'OpenSearch image is already here' : java ? `Java found (${java})` : 'Java 17 or 21 is installed',
+    'Install Java: sudo apt install openjdk-17-jre-headless — or, if that download is blocked, get the ready-made image file from Shriraj and run: docker load -i astra-opensearch-image.tar.gz',
+  );
+  for (const [port, name] of [[OS_PORT, 'OPENSEARCH_PORT'], [DASH_PORT, 'DASHBOARDS_PORT'], [SHIP_PORT, 'SHIPPER_PORT']]) {
+    const users = dockerOk ? run('docker', ['ps', '--filter', `publish=${port}`, '--format', '{{.Names}}']).stdout.trim().split('\n').filter(Boolean) : [];
+    const busy = run('bash', ['-c', `ss -ltnH 'sport = :${port}' | head -1`]).stdout.trim();
+    add(!busy || users.some((u) => CONTAINERS.includes(u)), `Port ${port} is free`, `Something else uses port ${port}. Pick another: echo "${name}=${Number(port) + 1}" >> .env`);
+  }
+  const freeGb = Number(run('bash', ['-c', "df -Pk /var/lib/docker 2>/dev/null | awk 'NR==2{print $4}' || df -Pk / | awk 'NR==2{print $4}'"]).stdout.trim()) / 1024 / 1024;
+  add(!freeGb || freeGb >= 4, `At least 4 GB of free disk (${freeGb ? `${freeGb.toFixed(0)} GB free` : 'unknown'})`, 'Free up some disk space (the first setup downloads about 2 GB).');
+  return checks;
+}
+
+async function ask(question) {
+  if (!process.stdin.isTTY) return null;
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question(question)).trim().toLowerCase();
+  rl.close();
+  return answer;
+}
+
+async function setup() {
+  const yes = args.includes('--yes') || args.includes('-y');
+  console.log('\nLocal OpenSearch setup\n======================\n');
+  console.log('Step 1 of 4 — Checking your laptop\n');
+  const checks = setupChecks();
+  for (const c of checks) (c.pass ? ok : bad)(c.label);
+  const missing = checks.filter((c) => !c.pass);
+  if (missing.length) {
+    console.log('\nPlease fix these first, then run  npm run setup  again:\n');
+    missing.forEach((c, i) => console.log(`  ${i + 1}. ${c.fix}`));
+    process.exit(1);
+  }
+
+  console.log('\nStep 2 of 4 — Starting OpenSearch, Dashboards and the log copier (first time: 3–5 minutes)\n');
+  await up({ fromSetup: true });
+
+  console.log('\nStep 3 of 4 — Connecting your local MNG and WL-MNG\n');
+  if (APPS.every(({ app }) => wiringState(app).wired)) ok('Already connected');
+  else {
+    info('This changes one setting (OPS_URL) in your local mng and wl-mng config files so their');
+    info('trace and notes screens read from this OpenSearch. The original files are saved first;');
+    info('"npm run unwire" puts them back exactly.');
+    const answer = yes ? 'y' : await ask('\n  Connect them now? [Y/n] ');
+    if (answer === null) warn('Not asked (no keyboard input). Run  npm run wire  yourself to connect them.');
+    else if (answer === '' || answer.startsWith('y')) await wire();
+    else warn('Skipped. Run  npm run wire  whenever you want to connect them.');
+  }
+
+  console.log('\nStep 4 of 4 — Testing it end to end');
+  const problems = await doctor();
+  if (problems) {
+    console.log('\nAlmost there: fix the ✗ lines above (each one says how), then run  npm run doctor  again.');
+    return;
+  }
+  console.log(`
+You're all set!
+
+  Try it in MNG:   open Transactions, then the "Transaction Trace" or "Add Internal Note" icon on any row
+  Dashboards:      ${DASH}   (same screen as mnops.cdmx.io, for your local data)
+  Quick lookup:    ${SHIP}
+
+It starts by itself whenever your laptop starts. To update later:  git pull && npm run setup`);
 }
 
 // ---------- main ----------
 
 const [cmd, ...args] = process.argv.slice(2);
 const commands = {
+  setup,
   up,
   down,
   status: () => status(),

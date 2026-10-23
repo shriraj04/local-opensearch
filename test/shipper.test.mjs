@@ -66,6 +66,19 @@ test('ids are stable, remote-shaped, and identical copies stay separate', () => 
   assert.deepEqual([a, a, '{"y":2}', a].map((raw) => docId(raw, again.next(raw))), ids);
 });
 
+test('a failed batch that is retried keeps the same ids for identical entries', () => {
+  const a = '{"ts":"2026-10-23T12:43:17.374Z","e_event":"COMPLETED","e_id":"124195"}';
+  const batch = [a, a, a];
+  const counter = new CopyCounter(2000);
+  const saved = counter.snapshot();
+  const firstTry = batch.map((raw) => docId(raw, counter.next(raw)));
+  counter.restore(saved); // the send failed
+  const retry = batch.map((raw) => docId(raw, counter.next(raw)));
+  assert.deepEqual(retry, firstTry);
+  const fresh = new CopyCounter(2000);
+  assert.deepEqual(batch.map((raw) => docId(raw, fresh.next(raw))), firstTry); // same as a full re-read
+});
+
 test('monthIndex uses UTC', () => {
   assert.equal(monthIndex('nps-app-', Date.parse('2026-10-31T23:30:00-02:00')), 'nps-app-2026.11');
 });

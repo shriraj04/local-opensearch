@@ -22,13 +22,12 @@ portals + n8n ──RPUSH──▶ Redis nps-logs ──(read only)──▶ log
 
 ## Start
 
-**Setting it up on your laptop for the first time? Follow [SETUP.md](SETUP.md).**
+**New here? Follow the [Easy Setup Guide](QUICK-SETUP.md): 3 steps, about 10 minutes.** Full details are in [SETUP.md](SETUP.md).
 
 ```bash
-git clone git@github.com:shriraj04/local-opensearch.git ~/local-opensearch && cd ~/local-opensearch
-npm run up       # starts everything, copies what is already in Redis, sets up Dashboards
-npm run wire     # once: points MNG + WL-MNG at it (only OPS_URL changes; the original is saved)
-npm run doctor   # proves it end to end
+cd ~/payment_system && git clone git@github.com:shriraj04/local-opensearch.git
+echo "local-opensearch/" >> .git/info/exclude      # never commit it into payment_system
+cd local-opensearch && npm run setup                # checks the laptop, starts it, connects MNG, tests it
 ```
 
 Needs Docker, Node 20+, Java 17 or 21 on this computer (found in `/usr/lib/jvm` or `JAVA_HOME`; not needed when the image is loaded ready-made, see SETUP.md), and the local ASTRA stack running (network `nps_default`, container `nps_redis`).
@@ -60,6 +59,7 @@ It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN,
 
 | Command | What it does |
 | --- | --- |
+| `npm run setup` | First-time setup in one go: checks the laptop (each ✗ says how to fix it), starts everything, asks before connecting MNG / WL-MNG, then runs the doctor. Safe to run again. |
 | `npm run up` | Starts OpenSearch, Dashboards and the log shipper (or updates them), waits until everything in Redis is copied, and sets up Dashboards. Safe to run again. |
 | `npm run status` | Whether everything is running, how many entries are copied, and whether MNG is wired. |
 | `npm run doctor` | Full check. It finds entries sampled from Redis in OpenSearch, checks that MNG can reach OpenSearch, and runs the Transaction Trace query with **MNG's own code inside the MNG container**, comparing the result with the status page. |

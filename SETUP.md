@@ -1,5 +1,7 @@
 # Set up Local OpenSearch (for the QA team)
 
+> Want the short version? See the **[Easy Setup Guide](QUICK-SETUP.md)** (3 steps). This page has every detail.
+
 After this, the OpenSearch screens work on **your** local `.local` domains, using your own local data:
 
 - MNG Transaction Trace
@@ -24,16 +26,18 @@ It takes about 10 minutes, once.
 
 ## Steps
 
-1. **Get it.** Any folder works:
+1. **Get it.** Clone it into your `payment_system` folder (next to `qa-astra`). It then finds your ASTRA code by itself, and your editor shows it as its own repository:
    ```bash
-   git clone git@github.com:shriraj04/local-opensearch.git ~/local-opensearch
-   cd ~/local-opensearch
+   cd ~/payment_system
+   git clone git@github.com:shriraj04/local-opensearch.git
+   echo "local-opensearch/" >> .git/info/exclude   # so it can never be committed into payment_system
+   cd local-opensearch
    ```
-2. **Only if your `payment_system` checkout is not at `~/payment_system`**, tell the tool where it is:
+2. **Only if you cloned it somewhere else and your `payment_system` checkout is not at `~/payment_system`**, tell the tool where it is:
    ```bash
    echo "ASTRA_REPO=/path/to/your/payment_system" > .env
    ```
-3. **Start it.** The first run takes 3–5 minutes because it downloads OpenSearch Dashboards and builds OpenSearch:
+3. **Start it.** (Or do steps 3–5 in one go with `npm run setup`.) The first run takes 3–5 minutes because it downloads OpenSearch Dashboards and builds OpenSearch:
    ```bash
    npm run up
    ```
