@@ -1,0 +1,45 @@
+{
+  "index_patterns": ["nps-app-*-fallback"],
+  "priority": 200,
+  "_meta": {
+    "description": "Entries nps-app-YYYY.MM refused (e.g. a value too long to index inside aux). Same document, aux not indexed, unknown fields not mapped, so nothing is lost. Still matched by nps-app-* in MNG and Dashboards.",
+    "managed_by": "astra-local-opensearch"
+  },
+  "template": {
+    "settings": {
+      "index.number_of_shards": 1,
+      "index.number_of_replicas": 0,
+      "index.refresh_interval": "1s",
+      "index.mapping.ignore_malformed": true
+    },
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "ts": { "type": "date" },
+        "level": { "type": "keyword", "ignore_above": 8191 },
+        "e_event": { "type": "keyword", "ignore_above": 8191 },
+        "e_id": { "type": "keyword", "ignore_above": 8191 },
+        "e_type": { "type": "keyword", "ignore_above": 8191 },
+        "error_code": { "type": "keyword", "ignore_above": 8191 },
+        "git_version": { "type": "keyword", "ignore_above": 8191 },
+        "msg": {
+          "type": "keyword",
+          "ignore_above": 8191,
+          "fields": { "text": { "type": "text" } }
+        },
+        "domain": { "type": "keyword", "ignore_above": 8191 },
+        "sys": { "type": "keyword", "ignore_above": 8191 },
+        "sess_id": { "type": "keyword", "ignore_above": 8191 },
+        "entry_type": { "type": "keyword", "ignore_above": 8191 },
+        "p_key": { "type": "keyword", "ignore_above": 8191 },
+        "p_value": { "type": "keyword", "ignore_above": 8191 },
+        "uid": { "type": "keyword", "ignore_above": 8191 },
+        "t_id": { "type": "keyword", "ignore_above": 8191 },
+        "ch_id": { "type": "keyword", "ignore_above": 8191 },
+        "is_note": { "type": "keyword", "ignore_above": 8191 },
+        "aux": { "type": "object", "enabled": false }
+      }
+    }
+  }
+}

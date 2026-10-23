@@ -1,0 +1,104 @@
+# Local OpenSearch for ASTRA traces (Transaction Trace, Notes, Account Trace, Internal Notes report).
+# Started and checked with `npm run up` / `npm run status` (see README.md), not by hand.
+#
+# Everything joins the ASTRA network nps_default, so MNG / WL-MNG reach OpenSearch at
+# http://astra-opensearch:9200, exactly like they reach Redis at nps_redis.
+# Host ports are bound to 127.0.0.1 only.
+name: astra-local-opensearch
+
+# Hard caps so these never spike the laptop: CPU and memory per container, and docker's own log files.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  opensearch:
+    # Built by `npm run up` from the official no-JDK OpenSearch + this computer's JDK (see opensearch/Dockerfile).
+    # Settings are in opensearch/opensearch.yml. No TLS / login on this local, loopback-only node
+    # (remote has both; the queries are the same).
+    build:
+      context: ./opensearch
+      args:
+        OPENSEARCH_VERSION: ${OPENSEARCH_VERSION:-2.19.6}
+        CONFIG_HASH: ${CONFIG_HASH:-}
+    image: astra-opensearch:${OPENSEARCH_VERSION:-2.19.6}-local
+    container_name: astra-opensearch
+    restart: unless-stopped
+    environment:
+      - OPENSEARCH_JAVA_OPTS=-Xms${OPENSEARCH_HEAP:-768m} -Xmx${OPENSEARCH_HEAP:-768m}
+    cpus: ${OPENSEARCH_CPUS:-1.5}
+    mem_limit: ${OPENSEARCH_MEM_LIMIT:-1536m}
+    logging: *logging
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - astra-opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "127.0.0.1:${OPENSEARCH_PORT:-9200}:9200"
+    networks:
+      nps:
+        aliases: [opensearch]
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:${DASHBOARDS_VERSION:-2.19.7}
+    container_name: astra-opensearch-dashboards
+    restart: unless-stopped
+    environment:
+      - OPENSEARCH_HOSTS=["http://astra-opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+      - SERVER_NAME=astra-local-opensearch
+      - NODE_OPTIONS=--max-old-space-size=512
+    cpus: ${DASHBOARDS_CPUS:-1.0}
+    mem_limit: ${DASHBOARDS_MEM_LIMIT:-1g}
+    logging: *logging
+    ports:
+      - "127.0.0.1:${DASHBOARDS_PORT:-5601}:5601"
+    networks: [nps]
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  shipper:
+    build: ./shipper
+    image: astra-log-shipper:local
+    container_name: astra-log-shipper
+    restart: unless-stopped
+    cpus: ${SHIPPER_CPUS:-0.5}
+    mem_limit: ${SHIPPER_MEM_LIMIT:-256m}
+    logging: *logging
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=192
+      - POLL_MS=400
+      - REDIS_HOST=${REDIS_HOST:-nps_redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_DB=${REDIS_DB:-0}
+      - LOG_REDIS_KEY=${LOG_REDIS_KEY:-nps-logs}
+      - OPENSEARCH_URL=http://astra-opensearch:9200
+      - DASHBOARDS_PUBLIC_URL=http://127.0.0.1:${DASHBOARDS_PORT:-5601}
+      # For the status-page lookup, which runs the product's own opensearch-query.js:
+      - OPS_URL=http://astra-opensearch:9200
+      - OPS_USERNAME=local
+      - OPS_PASSWORD=local
+      - NODE_PATH=/app/node_modules
+      - ASTRA_MOUNT=/astra
+    volumes:
+      # Read-only: the product's query module and action files, from whatever branch is checked out.
+      - ${ASTRA_REPO:?run it through npm run up, or set ASTRA_REPO in .env}/mng/app/api:/astra/mng/app/api:ro
+      - ${ASTRA_REPO:?run it through npm run up, or set ASTRA_REPO in .env}/mng/extensions/server_connect/modules:/astra/mng/extensions/server_connect/modules:ro
+      - ${ASTRA_REPO:?run it through npm run up, or set ASTRA_REPO in .env}/wl-mng/app/api:/astra/wl-mng/app/api:ro
+      - ${ASTRA_REPO:?run it through npm run up, or set ASTRA_REPO in .env}/wl-mng/extensions/server_connect/modules:/astra/wl-mng/extensions/server_connect/modules:ro
+    ports:
+      - "127.0.0.1:${SHIPPER_PORT:-9700}:9700"
+    networks: [nps]
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+networks:
+  nps:
+    external: true
+    name: nps_default
+
+volumes:
+  astra-opensearch-data:
+    name: astra-opensearch-data

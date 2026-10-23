@@ -1,0 +1,19 @@
+{
+  "name": "astra-log-shipper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ships the ASTRA Redis log list (nps-logs) into the local OpenSearch, read-only on Redis.",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@opensearch-project/opensearch": "3.9.0",
+    "dotenv": "16.6.1",
+    "ioredis": "5.11.1"
+  }
+}

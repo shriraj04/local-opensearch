@@ -1,0 +1,53 @@
+{
+  "index_patterns": ["nps-app-*"],
+  "priority": 100,
+  "_meta": {
+    "description": "Local copy of the remote nps-app-* indices (mnops.cdmx.io). Strings are keyword like remote: terms on entry_type and aggregations on domain / git_version work there without a .keyword sub-field.",
+    "managed_by": "astra-local-opensearch"
+  },
+  "template": {
+    "settings": {
+      "index.number_of_shards": 1,
+      "index.number_of_replicas": 0,
+      "index.refresh_interval": "1s",
+      "index.mapping.total_fields.limit": 5000,
+      "index.mapping.ignore_malformed": true
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "strings_as_keyword": {
+            "match_mapping_type": "string",
+            "mapping": { "type": "keyword", "ignore_above": 8191 }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "ts": { "type": "date" },
+        "level": { "type": "keyword" },
+        "e_event": { "type": "keyword" },
+        "e_id": { "type": "keyword" },
+        "e_type": { "type": "keyword" },
+        "error_code": { "type": "keyword" },
+        "git_version": { "type": "keyword" },
+        "msg": {
+          "type": "keyword",
+          "ignore_above": 8191,
+          "fields": { "text": { "type": "text" } }
+        },
+        "domain": { "type": "keyword" },
+        "sys": { "type": "keyword" },
+        "sess_id": { "type": "keyword" },
+        "entry_type": { "type": "keyword" },
+        "p_key": { "type": "keyword" },
+        "p_value": { "type": "keyword", "ignore_above": 8191 },
+        "uid": { "type": "keyword" },
+        "t_id": { "type": "keyword" },
+        "ch_id": { "type": "keyword" },
+        "is_note": { "type": "keyword" },
+        "aux": { "type": "flat_object" }
+      }
+    }
+  }
+}

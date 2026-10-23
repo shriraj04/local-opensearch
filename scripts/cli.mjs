@@ -1,0 +1,600 @@
+// ASTRA Local OpenSearch — one command for everything (see README.md):
+//   npm run up                 start (or update) OpenSearch, Dashboards and the log shipper; set up Dashboards
+//   npm run status             is everything running, how much is shipped, is MNG wired
+//   npm run doctor             end-to-end proof: Redis → OpenSearch → the product's own query, inside MNG
+//   npm run wire / unwire      point MNG + WL-MNG at the local OpenSearch / put the original OPS_URL back
+//   npm run trace -- tx 189444            Transaction Trace      (also: notes 189444, account 140,
+//                                          internal-notes 2026-10-01 2026-10-23, wl-trace 189444)
+//   npm run logs [-- shipper|opensearch|dashboards] [-- -f]
+//   npm run down               stop the containers (data is kept)
+import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setupDashboards } from './dashboards.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const dotenv = readDotEnv(path.join(ROOT, '.env'));
+const setting = (key, fallback) => process.env[key] || dotenv[key] || fallback;
+
+const ASTRA_REPO = setting('ASTRA_REPO', path.join(os.homedir(), 'payment_system'));
+const OS_PORT = setting('OPENSEARCH_PORT', '9200');
+const DASH_PORT = setting('DASHBOARDS_PORT', '5601');
+const SHIP_PORT = setting('SHIPPER_PORT', '9700');
+const OS = `http://127.0.0.1:${OS_PORT}`;
+const DASH = `http://127.0.0.1:${DASH_PORT}`;
+const SHIP = `http://127.0.0.1:${SHIP_PORT}`;
+const IN_NETWORK_URL = 'http://astra-opensearch:9200';
+const WIRE_DIR = path.join(os.homedir(), '.config', 'astra-local', 'opensearch-wiring');
+const APPS = [
+  { app: 'mng', container: 'nps_admin_web', domain: 'qa-alpha-astramng.local' },
+  { app: 'wl-mng', container: 'nps_wl-mng_web', domain: 'qa-alpha-astrawlmng.local' },
+];
+const CONTAINERS = ['astra-opensearch', 'astra-opensearch-dashboards', 'astra-log-shipper'];
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const fmt = (n) => (n === null || n === undefined ? '–' : Number(n).toLocaleString('en-US'));
+const ok = (m) => console.log(`  ✓ ${m}`);
+const bad = (m) => console.log(`  ✗ ${m}`);
+const warn = (m) => console.log(`  ! ${m}`);
+const info = (m) => console.log(`    ${m}`);
+function fail(message) {
+  console.error(`✗ ${message}`);
+  process.exit(1);
+}
+
+function readDotEnv(file) {
+  try {
+    return Object.fromEntries(
+      fs
+        .readFileSync(file, 'utf8')
+        .split('\n')
+        .map((l) => l.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/))
+        .filter(Boolean)
+        .map((m) => [m[1], m[2].replace(/^["']|["']$/g, '')]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function run(cmd, args, opts = {}) {
+  return spawnSync(cmd, args, { encoding: 'utf8', cwd: ROOT, ...opts });
+}
+function compose(args, opts = {}) {
+  return run('docker', ['compose', ...args], { ...opts, env: { ...process.env, ASTRA_REPO, ...(opts.env || {}) } });
+}
+
+async function getJson(url, init) {
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(init?.timeout || 8000) });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* not JSON */
+  }
+  return { status: res.status, json, text };
+}
+async function tryJson(url, init) {
+  try {
+    return await getJson(url, init);
+  } catch {
+    return null;
+  }
+}
+
+function containerState(name) {
+  const r = run('docker', ['inspect', name, '--format', '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}']);
+  return r.status === 0 ? r.stdout.trim() : 'missing';
+}
+
+// ---------- wiring (MNG / WL-MNG config.json, OPS_URL only) ----------
+
+const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+const configFile = (app) => path.join(ASTRA_REPO, app, 'app', 'config', 'config.json');
+
+function readOpsUrl(text) {
+  return JSON.parse(text).env?.OPS_URL;
+}
+
+/** Replaces the one "OPS_URL": "<value>" in the text, keeping every other byte. */
+function replaceOpsUrl(text, from, to) {
+  const pattern = new RegExp(`("OPS_URL"\\s*:\\s*)${JSON.stringify(from).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'g');
+  const hits = text.match(pattern) || [];
+  if (hits.length !== 1) throw new Error(`expected exactly one "OPS_URL": ${JSON.stringify(from)}, found ${hits.length}`);
+  const out = text.replace(pattern, `$1${JSON.stringify(to)}`);
+  // nothing but OPS_URL may differ
+  const a = JSON.parse(text);
+  const b = JSON.parse(out);
+  b.env.OPS_URL = a.env.OPS_URL;
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error('refusing: the edit would change more than OPS_URL');
+  return out;
+}
+
+function wiringState(app) {
+  const file = configFile(app);
+  if (!fs.existsSync(file)) return { app, file, exists: false };
+  const text = fs.readFileSync(file, 'utf8');
+  let url;
+  try {
+    url = readOpsUrl(text);
+  } catch (err) {
+    return { app, file, exists: true, error: `not valid JSON: ${err.message}` };
+  }
+  const backup = path.join(WIRE_DIR, `${app}.config.json.orig`);
+  return { app, file, exists: true, url, wired: url === IN_NETWORK_URL, hasBackup: fs.existsSync(backup), backup };
+}
+
+const hostOf = (url) => {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return url ? '(not a URL)' : '(empty)';
+  }
+};
+
+async function wire() {
+  console.log('Pointing MNG and WL-MNG at the local OpenSearch (only OPS_URL changes):');
+  fs.mkdirSync(WIRE_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(WIRE_DIR, 0o700);
+  for (const { app } of APPS) {
+    const s = wiringState(app);
+    if (!s.exists) {
+      warn(`${app}: ${s.file} not found — skipped`);
+      continue;
+    }
+    if (s.error) fail(`${app}: ${s.error}`);
+    if (s.wired) {
+      ok(`${app}: already wired (OPS_URL = ${IN_NETWORK_URL})`);
+      continue;
+    }
+    const original = fs.readFileSync(s.file);
+    const metaFile = path.join(WIRE_DIR, `${app}.json`);
+    // keep the very first original; a later wire after an edit by someone else adds a dated copy
+    if (fs.existsSync(s.backup) && sha256(fs.readFileSync(s.backup)) !== sha256(original)) {
+      fs.copyFileSync(s.backup, `${s.backup}.${Date.now()}`);
+    }
+    fs.writeFileSync(s.backup, original, { mode: 0o600 });
+    const wired = replaceOpsUrl(original.toString('utf8'), s.url, IN_NETWORK_URL);
+    const mode = fs.statSync(s.file).mode & 0o777;
+    fs.writeFileSync(s.file, wired, { mode });
+    fs.writeFileSync(
+      metaFile,
+      JSON.stringify(
+        {
+          app,
+          file: s.file,
+          wired_at: new Date().toISOString(),
+          original_sha256: sha256(original),
+          wired_sha256: sha256(Buffer.from(wired)),
+          original_ops_url_host: hostOf(s.url),
+        },
+        null,
+        2,
+      ),
+      { mode: 0o600 },
+    );
+    ok(`${app}: OPS_URL ${hostOf(s.url)} → ${IN_NETWORK_URL}  (original saved: ${s.backup})`);
+  }
+  console.log('\n  MNG / WL-MNG restart by themselves (nodemon) in a few seconds.');
+  await waitForPortals();
+  console.log('\n  Undo any time with: npm run unwire');
+}
+
+async function unwire() {
+  console.log('Putting the original OPS_URL back in MNG and WL-MNG:');
+  for (const { app } of APPS) {
+    const s = wiringState(app);
+    const metaFile = path.join(WIRE_DIR, `${app}.json`);
+    if (!s.exists) {
+      warn(`${app}: ${s.file} not found — skipped`);
+      continue;
+    }
+    if (!s.wired) {
+      ok(`${app}: not wired (OPS_URL = ${hostOf(s.url)}) — nothing to do`);
+      continue;
+    }
+    if (!s.hasBackup || !fs.existsSync(metaFile)) fail(`${app}: wired but no backup in ${WIRE_DIR}; set OPS_URL back by hand`);
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+    const backup = fs.readFileSync(s.backup);
+    const current = fs.readFileSync(s.file);
+    if (sha256(current) === meta.wired_sha256) {
+      fs.writeFileSync(s.file, backup); // byte-identical original
+      const check = sha256(fs.readFileSync(s.file)) === meta.original_sha256;
+      (check ? ok : bad)(`${app}: original restored byte-identical (OPS_URL = ${hostOf(readOpsUrl(backup.toString('utf8')))})`);
+    } else {
+      // the file was edited since wiring: put back only the OPS_URL value, keep the other edits
+      const restored = replaceOpsUrl(current.toString('utf8'), IN_NETWORK_URL, readOpsUrl(backup.toString('utf8')));
+      fs.writeFileSync(s.file, restored);
+      warn(`${app}: the file changed since wiring, so only OPS_URL was put back (other edits kept)`);
+    }
+  }
+  console.log('\n  MNG / WL-MNG restart by themselves (nodemon) in a few seconds.');
+  await waitForPortals();
+}
+
+async function waitForPortals() {
+  await sleep(3000);
+  for (const { app, domain } of APPS) {
+    let up = false;
+    for (let i = 0; i < 30 && !up; i += 1) {
+      const r = run('curl', ['-sk', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '5', `https://${domain}/login`]);
+      up = /^(2|3)\d\d$/.test(r.stdout);
+      if (!up) await sleep(2000);
+    }
+    (up ? ok : warn)(`${app}: https://${domain} ${up ? 'is back up' : 'did not answer yet — check `docker logs nps_' + (app === 'mng' ? 'admin' : 'wl-mng') + '_web`'}`);
+  }
+}
+
+// ---------- up / down / status ----------
+
+async function waitFor(label, check, timeoutMs, everyMs = 2000) {
+  const started = Date.now();
+  process.stdout.write(`  … ${label}`);
+  while (Date.now() - started < timeoutMs) {
+    const result = await check();
+    if (result) {
+      process.stdout.write(` ✓ (${Math.round((Date.now() - started) / 1000)} s)\n`);
+      return result;
+    }
+    process.stdout.write('.');
+    await sleep(everyMs);
+  }
+  process.stdout.write(' ✗ timed out\n');
+  return null;
+}
+
+// OpenSearch is built from the official no-JDK distribution on Maven Central plus this computer's JDK,
+// because the office web gateway cuts downloads of the JDK bundled in the official image/tarballs.
+async function prepareOpenSearchBuild() {
+  const version = setting('OPENSEARCH_VERSION', '2.19.6');
+  const buildDir = path.join(ROOT, 'opensearch', 'build');
+  const distDir = path.join(buildDir, `opensearch-${version}`);
+  const jdkDir = path.join(buildDir, 'jdk');
+  fs.mkdirSync(buildDir, { recursive: true });
+
+  if (!fs.existsSync(path.join(distDir, 'bin', 'opensearch'))) {
+    const zip = path.join(buildDir, `opensearch-${version}.zip`);
+    const url = `https://repo1.maven.org/maven2/org/opensearch/distribution/integ-test-zip/opensearch/${version}/opensearch-${version}.zip`;
+    console.log(`  … downloading OpenSearch ${version} (no-JDK distribution, Maven Central)`);
+    let done = false;
+    for (let attempt = 1; attempt <= 8 && !done; attempt += 1) {
+      run('curl', ['-sf', '--http1.1', '-C', '-', '--max-time', '300', '-o', zip, url]);
+      const sha = run('curl', ['-sf', '--max-time', '30', `${url}.sha512`]).stdout.trim().split(/\s+/)[0];
+      done = sha && sha512File(zip) === sha;
+    }
+    if (!done) fail(`could not download ${url} with a matching sha512`);
+    const unzip = run('python3', ['-I', '-c', 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])', zip, buildDir]);
+    if (unzip.status !== 0) fail(`could not unpack ${zip}: ${unzip.stderr}`);
+    for (const f of fs.readdirSync(path.join(distDir, 'bin'))) fs.chmodSync(path.join(distDir, 'bin', f), 0o755);
+    ok(`OpenSearch ${version} downloaded and verified (sha512)`);
+  }
+
+  if (!fs.existsSync(path.join(jdkDir, 'bin', 'java'))) {
+    const jvmDirs = fs.existsSync('/usr/lib/jvm') ? fs.readdirSync('/usr/lib/jvm').map((d) => path.join('/usr/lib/jvm', d)) : [];
+    const candidates = [process.env.JAVA_HOME, ...jvmDirs.filter((d) => /(^|[-.])21([-.]|$)/.test(path.basename(d))), ...jvmDirs.filter((d) => /(^|[-.])17([-.]|$)/.test(path.basename(d)))].filter(Boolean);
+    const jdk = candidates.find((d) => fs.existsSync(path.join(d, 'bin', 'java')) && !fs.lstatSync(d).isSymbolicLink());
+    if (!jdk) {
+      fail('No Java 17 or 21 found on this computer. Install it (sudo apt install openjdk-17-jre-headless), set JAVA_HOME, or load the ready-made image instead (see SETUP.md, "If Java will not install").');
+    }
+    const cp = run('cp', ['-rL', jdk, jdkDir]);
+    if (cp.status !== 0 && !fs.existsSync(path.join(jdkDir, 'bin', 'java'))) fail(`could not copy ${jdk}: ${cp.stderr}`);
+    for (const extra of ['docs', 'man', 'jmods', 'include']) fs.rmSync(path.join(jdkDir, extra), { recursive: true, force: true });
+    ok(`Java for OpenSearch copied from ${jdk}`);
+  }
+}
+
+function sha512File(file) {
+  try {
+    return crypto.createHash('sha512').update(fs.readFileSync(file)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+async function up() {
+  console.log('Starting ASTRA Local OpenSearch\n');
+  if (run('docker', ['info', '--format', '{{.ServerVersion}}']).status !== 0) fail('Docker is not running.');
+  if (run('docker', ['network', 'inspect', 'nps_default']).status !== 0) {
+    fail('The ASTRA docker network nps_default does not exist — start the local ASTRA stack first.');
+  }
+  if (!containerState('nps_redis').startsWith('running')) warn('nps_redis is not running: the shipper will wait for it.');
+  if (Number(process.versions.node.split('.')[0]) < 20) fail(`Node 20 or later is needed (this is ${process.version}).`);
+  for (const rel of ['mng/app/api', 'mng/extensions/server_connect/modules', 'wl-mng/app/api', 'wl-mng/extensions/server_connect/modules']) {
+    if (!fs.existsSync(path.join(ASTRA_REPO, rel))) {
+      fail(`${path.join(ASTRA_REPO, rel)} not found. Put the path of your payment_system checkout in .env as ASTRA_REPO=/path/to/payment_system`);
+    }
+  }
+  // Ports already taken by something else (our own containers holding them is fine).
+  for (const [port, name] of [[OS_PORT, 'OPENSEARCH_PORT'], [DASH_PORT, 'DASHBOARDS_PORT'], [SHIP_PORT, 'SHIPPER_PORT']]) {
+    const users = run('docker', ['ps', '--filter', `publish=${port}`, '--format', '{{.Names}}']).stdout.trim().split('\n').filter(Boolean);
+    const busy = run('bash', ['-c', `ss -ltnH 'sport = :${port}' | head -1`]).stdout.trim();
+    if (busy && !users.some((u) => CONTAINERS.includes(u))) fail(`port ${port} is already used by another program. Pick another one in .env, e.g. ${name}=${Number(port) + 1}`);
+  }
+
+  // OpenSearch image: built once (or when its Dockerfile/config change); can also be loaded ready-made (SETUP.md).
+  const osVersion = setting('OPENSEARCH_VERSION', '2.19.6');
+  const osImage = `astra-opensearch:${osVersion}-local`;
+  // The image carries a hash of its Dockerfile + opensearch.yml, so a loaded or older image is rebuilt
+  // only when those files really differ (file dates change on every clone).
+  const configHash = crypto
+    .createHash('sha256')
+    .update(['Dockerfile', 'opensearch.yml'].map((f) => fs.readFileSync(path.join(ROOT, 'opensearch', f), 'utf8')).join('\0'))
+    .digest('hex')
+    .slice(0, 16);
+  const imageHash = run('docker', ['image', 'inspect', osImage, '--format', '{{index .Config.Labels "astra.config_hash"}}']).stdout.trim();
+  if (imageHash !== configHash) {
+    await prepareOpenSearchBuild();
+    const built = compose(['build', 'opensearch'], { stdio: 'inherit', env: { ...process.env, ASTRA_REPO, CONFIG_HASH: configHash } });
+    if (built.status !== 0) fail('building the OpenSearch image failed (see above).');
+  } else ok(`OpenSearch image ${osImage} ready`);
+  if (compose(['build', 'shipper'], { stdio: 'inherit' }).status !== 0) fail('building the shipper image failed (see above).');
+
+  const r = compose(['up', '-d', '--remove-orphans'], { stdio: 'inherit' });
+  if (r.status !== 0) fail('docker compose up failed (see above).');
+  console.log('');
+
+  const health = await waitFor('OpenSearch', async () => {
+    const h = await tryJson(`${OS}/_cluster/health`);
+    return h && h.status === 200 && h.json.status !== 'red' ? h.json : null;
+  }, 240_000);
+  if (!health) fail('OpenSearch did not start. See: npm run logs -- opensearch');
+
+  const shipped = await waitFor('Shipper: copying Redis nps-logs into OpenSearch', async () => {
+    const s = await tryJson(`${SHIP}/status`);
+    if (s && s.json && s.json.lag !== null) {
+      process.stdout.write(`\r  … Shipper: copying Redis nps-logs into OpenSearch — ${fmt(s.json.shipped)} / ${fmt(s.json.redis.length)}   `);
+      return s.json.lag === 0 ? s.json : null;
+    }
+    return null;
+  }, 600_000, 1500);
+  if (!shipped) warn('The shipper is still catching up; it continues in the background (npm run status).');
+
+  const dash = await waitFor('OpenSearch Dashboards', async () => {
+    const s = await tryJson(`${DASH}/api/status`);
+    return s && s.status === 200 && s.json?.status?.overall?.state === 'green' ? s.json : null;
+  }, 300_000, 3000);
+  if (dash) {
+    await setupDashboards(DASH);
+    ok('Dashboards set up: index pattern nps-app-*, saved searches for every MNG trace screen');
+  } else warn('Dashboards is still starting; run `npm run up` again in a minute to finish setting it up.');
+
+  await status({ short: true });
+}
+
+function down() {
+  const r = compose(['stop'], { stdio: 'inherit' });
+  if (r.status !== 0) fail('docker compose stop failed.');
+  console.log('\nStopped. Data is kept; `npm run up` starts it again.');
+  const wired = APPS.map(({ app }) => wiringState(app)).filter((s) => s.wired);
+  if (wired.length) console.log(`Note: ${wired.map((s) => s.app).join(' and ')} still point at the local OpenSearch; trace screens will error until it is up (or run: npm run unwire).`);
+}
+
+async function status({ short = false } = {}) {
+  console.log('\nASTRA Local OpenSearch\n');
+  for (const c of CONTAINERS) {
+    const st = containerState(c);
+    (st.startsWith('running') && !st.includes('unhealthy') ? ok : bad)(`${c.padEnd(28)} ${st}`);
+  }
+  const s = await tryJson(`${SHIP}/status`);
+  const idx = await tryJson(`${SHIP}/api/indices`);
+  console.log('');
+  if (s && s.json) {
+    const j = s.json;
+    const docs = Array.isArray(idx?.json) ? idx.json.filter((i) => i.index.startsWith('nps-app-')).reduce((n, i) => n + i.docs, 0) : null;
+    (j.redis.connected ? ok : bad)(`Redis ${j.redis.list}: ${fmt(j.redis.length)} entries`);
+    (j.opensearch.reachable ? ok : bad)(`OpenSearch nps-app-*: ${fmt(docs)} documents`);
+    (j.lag === 0 ? ok : warn)(j.lag === 0 ? 'Shipper: live, nothing waiting' : `Shipper: ${fmt(j.lag)} entries waiting`);
+    (j.rejected ? warn : ok)(`Rejected by OpenSearch: ${fmt(j.rejected)}${j.rejected ? ' (kept in astra-shipper-rejected)' : ''}`);
+    if (j.last_error && (!j.redis.connected || !j.opensearch.reachable)) info(`last error: ${j.last_error}`);
+  } else bad(`Shipper status page not reachable at ${SHIP}`);
+
+  console.log('');
+  for (const { app } of APPS) {
+    const w = wiringState(app);
+    if (!w.exists) warn(`${app}: config.json not found`);
+    else if (w.wired) ok(`${app}: wired → reads traces from this local OpenSearch`);
+    else warn(`${app}: not wired (OPS_URL = ${hostOf(w.url)}) — run: npm run wire`);
+  }
+  console.log(`\n  Status & lookup page:   ${SHIP}`);
+  console.log(`  OpenSearch Dashboards:  ${DASH}/app/data-explorer/discover`);
+  console.log(`  OpenSearch API:         ${OS}`);
+  if (!short) console.log('\n  Full check: npm run doctor');
+}
+
+function logs(args) {
+  const follow = args.includes('-f');
+  const which = args.find((a) => !a.startsWith('-'));
+  const services = { shipper: 'shipper', opensearch: 'opensearch', dashboards: 'dashboards' };
+  const svc = which ? services[which] : 'shipper';
+  if (!svc) fail(`unknown service "${which}" (shipper, opensearch, dashboards)`);
+  compose(['logs', '--tail', '200', ...(follow ? ['-f'] : []), svc], { stdio: 'inherit' });
+}
+
+// ---------- trace lookups (same query as the MNG screen) ----------
+
+const TRACE_KINDS = {
+  tx: ['tx-trace', ['tx_id']],
+  notes: ['tx-notes', ['tx_id']],
+  account: ['account-trace', ['account_id']],
+  'internal-notes': ['internal-notes', ['from_date', 'to_date']],
+  'wl-trace': ['wl-tx-trace', ['tx_id']],
+};
+
+function dayRange(from, to) {
+  // like the MNG report: whole days in this computer's time zone, sent as UTC
+  const f = new Date(`${from}T00:00:00`);
+  const t = new Date(`${to}T23:59:59.999`);
+  if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime())) fail('dates must look like 2026-10-01');
+  return [f.toISOString(), t.toISOString()];
+}
+
+async function trace(args) {
+  const [what, ...rest] = args;
+  const spec = TRACE_KINDS[what];
+  if (!spec) {
+    fail('usage: npm run trace -- tx <id> | notes <id> | account <id> | internal-notes <from> <to> | wl-trace <id>');
+  }
+  const [kind, names] = spec;
+  if (rest.length < names.length) fail(`${what} needs: ${names.join(' ')}`);
+  let values = rest.slice(0, names.length);
+  if (kind === 'internal-notes') values = dayRange(values[0], values[1]);
+  const qs = new URLSearchParams({ kind, ...Object.fromEntries(names.map((n, i) => [n, values[i]])) });
+  const r = await tryJson(`${SHIP}/api/lookup?${qs}`, { timeout: 60_000 });
+  if (!r) fail(`the shipper is not reachable at ${SHIP} — run: npm run up`);
+  if (r.json?.error) fail(r.json.error);
+  const j = r.json;
+  console.log(`\n${j.label} — ${fmt(j.count)} row${j.count === 1 ? '' : 's'}   (same query as ${j.where})`);
+  console.log(`  ${j.action_file} → ${j.module_file}, ${j.took_ms} ms\n`);
+  const rows = j.rows.map((row) =>
+    kind === 'internal-notes'
+      ? [row.ts, String(row.t_id ?? ''), String(row.uid ?? ''), (row.aux?.post?.note || '').slice(0, 80)]
+      : [row.ts, row.e_event, row.level, String(row.uid ?? ''), (typeof row.msg === 'object' ? JSON.stringify(row.msg) : String(row.msg ?? '')).slice(0, 90)],
+  );
+  const head = kind === 'internal-notes' ? ['ts (UTC)', 't_id', 'uid', 'note'] : ['ts (UTC)', 'e_event', 'level', 'uid', 'msg'];
+  printTable(head, rows);
+  console.log(`\n  Page:       ${SHIP}/?${qs}`);
+}
+
+function printTable(head, rows) {
+  if (!rows.length) {
+    console.log('  (no rows — MNG would show "no records found")');
+    return;
+  }
+  const widths = head.map((h, i) => Math.min(60, Math.max(h.length, ...rows.map((r) => String(r[i] ?? '').length))));
+  const line = (cells) => `  ${cells.map((c, i) => String(c ?? '').slice(0, widths[i]).padEnd(widths[i])).join('  ')}`;
+  console.log(line(head));
+  console.log(line(widths.map((w) => '─'.repeat(w))));
+  rows.forEach((r) => console.log(line(r)));
+}
+
+// ---------- doctor ----------
+
+async function doctor() {
+  let problems = 0;
+  const check = (pass, good, badMsg) => {
+    if (pass) ok(good);
+    else {
+      bad(badMsg);
+      problems += 1;
+    }
+  };
+  console.log('\nDoctor — ASTRA Local OpenSearch\n');
+
+  console.log('Containers');
+  for (const c of CONTAINERS) {
+    const st = containerState(c);
+    check(st.startsWith('running') && !st.includes('unhealthy'), `${c} ${st}`, `${c} ${st} — run: npm run up`);
+  }
+
+  console.log('\nOpenSearch');
+  const h = await tryJson(`${OS}/_cluster/health`);
+  check(h?.json && h.json.status !== 'red', `cluster ${h?.json?.status} (${h?.json?.cluster_name})`, 'not reachable / red');
+  const canonical = (v) =>
+    Array.isArray(v) ? v.map(canonical) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonical(v[k])])) : v;
+  for (const [name, file, label] of [
+    ['nps-app', 'index-template.json', 'index template nps-app-* (strings keyword, ts/@timestamp date)'],
+    ['nps-app-fallback', 'index-template-fallback.json', 'fallback template nps-app-*-fallback'],
+  ]) {
+    const tpl = await tryJson(`${OS}/_index_template/${name}`);
+    const want = JSON.parse(fs.readFileSync(path.join(ROOT, 'shipper', file), 'utf8'));
+    const have = tpl?.json?.index_templates?.[0]?.index_template;
+    const same = have && JSON.stringify(canonical(have.template.mappings)) === JSON.stringify(canonical(want.template.mappings));
+    check(same, `${label} in place`, `${label} missing or different — run: npm run up`);
+  }
+
+  console.log('\nShipper');
+  const s = (await tryJson(`${SHIP}/status`))?.json;
+  check(s?.redis?.connected, `reads Redis ${s?.redis?.list} (${fmt(s?.redis?.length)} entries)`, 'cannot read Redis');
+  check(s && s.lag === 0, 'live: every entry in the list is shipped', `${fmt(s?.lag)} entries still waiting`);
+  if (s?.rejected) warn(`${fmt(s.rejected)} entries rejected by OpenSearch (see index astra-shipper-rejected in Dashboards)`);
+
+  // Sample entries straight from Redis and find each one in OpenSearch.
+  const len = Number(run('docker', ['exec', 'nps_redis', 'redis-cli', 'LLEN', 'nps-logs']).stdout.trim());
+  if (len > 0) {
+    const picks = [...new Set([0, len - 1, ...Array.from({ length: 18 }, () => Math.floor(Math.random() * len))])];
+    let found = 0;
+    let checked = 0;
+    for (const i of picks) {
+      const raw = run('docker', ['exec', 'nps_redis', 'redis-cli', '--raw', 'LINDEX', 'nps-logs', String(i)]).stdout.replace(/\n$/, '');
+      let e;
+      try {
+        e = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      if (!e || typeof e !== 'object' || !e.ts) continue;
+      checked += 1;
+      const filter = [{ term: { ts: e.ts } }];
+      if (e.e_id !== undefined && e.e_id !== '') filter.push({ term: { e_id: String(e.e_id) } });
+      if (e.e_event) filter.push({ term: { e_event: e.e_event } });
+      const q = await tryJson(`${OS}/nps-app-*/_count`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: { bool: { filter } } }) });
+      if (q?.json?.count > 0) found += 1;
+    }
+    check(found === checked, `${found}/${checked} entries sampled from Redis (oldest, newest, random) are in OpenSearch`, `only ${found}/${checked} sampled entries found in OpenSearch`);
+  }
+
+  console.log('\nMNG / WL-MNG');
+  // a recent transaction with trace rows, to compare both query paths on
+  const recent = await tryJson(`${OS}/nps-app-*/_search`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ size: 1, sort: [{ ts: 'desc' }], query: { bool: { filter: [{ term: { p_key: 'TRANSACTION' } }, { term: { entry_type: 'TRACE' } }] } }, _source: ['p_value'] }),
+  });
+  const txId = recent?.json?.hits?.hits?.[0]?._source?.p_value;
+  for (const { app, container } of APPS) {
+    const w = wiringState(app);
+    check(w.exists && w.wired, `${app}: config OPS_URL → ${IN_NETWORK_URL}`, `${app}: not wired (OPS_URL = ${hostOf(w.url)}) — run: npm run wire`);
+    // Can the portal container reach it? (read-only check inside the running product container)
+    const reach = run('docker', ['exec', container, 'node', '-e', `fetch(${JSON.stringify(IN_NETWORK_URL)}).then(r=>r.json()).then(j=>console.log(j.cluster_name)).catch(e=>console.log('ERR '+e.message))`]);
+    check(reach.stdout.includes('astra-local'), `${container} reaches ${IN_NETWORK_URL}`, `${container} cannot reach ${IN_NETWORK_URL}: ${(reach.stdout + reach.stderr).trim().slice(0, 160)}`);
+  }
+  if (txId) {
+    // The product's module, run by the product's node inside the MNG container, versus the status-page lookup.
+    const inside = run('docker', ['exec', '-e', `OPS_URL=${IN_NETWORK_URL}`, 'nps_admin_web', 'node', '-e', `
+      const m = require('/opt/node_app/extensions/server_connect/modules/opensearch-query.js');
+      m.ops_query.call({ parse: (v) => v }, { output_fields: 'e_event,msg,level,ts,uid,aux,domain', sort_field: 'ts', p_key: 'TRANSACTION', p_value: ${JSON.stringify(String(txId))}, entry_type: ['TRACE','NOTE'] })
+        .then((rows) => console.log('ROWS', rows.length)).catch((e) => console.log('ERR', e.message));`]);
+    const insideRows = Number((inside.stdout.match(/ROWS (\d+)/) || [])[1]);
+    const page = await tryJson(`${SHIP}/api/lookup?kind=tx-trace&tx_id=${encodeURIComponent(txId)}`, { timeout: 60_000 });
+    check(
+      Number.isFinite(insideRows) && insideRows > 0 && page?.json?.count === insideRows,
+      `Transaction Trace of tx ${txId}: ${insideRows} rows from MNG's own code inside nps_admin_web = ${page?.json?.count} on the status page`,
+      `Transaction Trace of tx ${txId}: MNG container ${inside.stdout.trim() || inside.stderr.trim().slice(0, 160)}, status page ${page?.json?.count ?? page?.json?.error}`,
+    );
+  } else warn('no transaction trace rows in OpenSearch yet — create a transaction locally, then run doctor again');
+
+  console.log('\nDashboards');
+  const ip = await tryJson(`${DASH}/api/saved_objects/index-pattern/nps-app`);
+  check(ip?.status === 200, `index pattern nps-app-* ready at ${DASH}`, 'Dashboards not set up — run: npm run up');
+
+  console.log(problems ? `\n✗ ${problems} problem(s) found.` : '\n✓ All good: local traces work end to end.');
+  process.exitCode = problems ? 1 : 0;
+}
+
+// ---------- main ----------
+
+const [cmd, ...args] = process.argv.slice(2);
+const commands = {
+  up,
+  down,
+  status: () => status(),
+  doctor,
+  wire,
+  unwire,
+  logs: () => logs(args),
+  trace: () => trace(args),
+  dashboards: async () => {
+    await setupDashboards(DASH);
+    ok('Dashboards set up');
+  },
+};
+if (!commands[cmd]) {
+  console.log(fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').filter((l) => l.startsWith('//')).map((l) => l.slice(3)).join('\n'));
+  process.exit(cmd ? 1 : 0);
+}
+await commands[cmd]();

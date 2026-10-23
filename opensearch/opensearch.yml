@@ -1,0 +1,12 @@
+# Single local node for ASTRA traces (see ../README.md).
+cluster.name: astra-local
+node.name: astra-opensearch
+network.host: 0.0.0.0
+discovery.type: single-node
+path.data: /usr/share/opensearch/data
+path.logs: /usr/share/opensearch/logs
+# The host keeps vm.max_map_count at 65530; this avoids needing sudo sysctl.
+node.store.allow_mmap: false
+# The disk is ~80% full: never refuse new monthly indices or turn indices read-only for disk space.
+cluster.routing.allocation.disk.threshold_enabled: false
+action.auto_create_index: true

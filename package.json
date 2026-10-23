@@ -1,0 +1,22 @@
+{
+  "name": "astra-local-opensearch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local OpenSearch for ASTRA traces: MNG Transaction Trace, Notes, Account Trace and Internal Notes work on the .local domains, fed live from Redis nps-logs.",
+  "type": "module",
+  "scripts": {
+    "up": "node scripts/cli.mjs up",
+    "down": "node scripts/cli.mjs down",
+    "status": "node scripts/cli.mjs status",
+    "doctor": "node scripts/cli.mjs doctor",
+    "wire": "node scripts/cli.mjs wire",
+    "unwire": "node scripts/cli.mjs unwire",
+    "trace": "node scripts/cli.mjs trace",
+    "logs": "node scripts/cli.mjs logs",
+    "dashboards": "node scripts/cli.mjs dashboards",
+    "test": "TZ=UTC node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
