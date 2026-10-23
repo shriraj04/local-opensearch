@@ -14,6 +14,7 @@
     "trace": "node scripts/cli.mjs trace",
     "logs": "node scripts/cli.mjs logs",
     "dashboards": "node scripts/cli.mjs dashboards",
+    "pretest": "npm --prefix shipper ci --no-audit --no-fund --silent",
     "test": "TZ=UTC node --test test/*.test.mjs"
   },
   "engines": {
