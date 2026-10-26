@@ -27,6 +27,9 @@ export const config = {
   // Where the shipper keeps its position, so a restart (even after weeks) continues instead of re-reading
   // the whole list. Kept in OpenSearch itself: if the data is wiped, the position goes with it.
   stateIndex: env.STATE_INDEX || 'astra-shipper-state',
+  // Health for the home dashboard in OpenSearch Dashboards (one document, rewritten every 15 s).
+  healthIndex: env.HEALTH_INDEX || 'astra-shipper-health',
+  healthEveryMs: Number(env.HEALTH_EVERY_MS || 15000),
   saveEveryMs: Number(env.SAVE_EVERY_MS || 2000),
   // Keep this many days of traces (today included); older daily indices are dropped by themselves.
   // n8n's crons alone write ~6,000 lines an hour, so without a limit the data keeps growing. 0 = keep all.
@@ -187,6 +190,29 @@ async function ensureIndexSetup() {
     const template = fs.readFileSync(path.join(HERE, file), 'utf8');
     const put = await os('PUT', `/_index_template/${name}`, template);
     if (put.status !== 200) throw new Error(`index template ${name} not accepted (${put.status}): ${put.text.slice(0, 300)}`);
+  }
+
+  if ((await os('HEAD', `/${config.healthIndex}`)).status === 404) {
+    const date = { type: 'date' };
+    const long = { type: 'long' };
+    const made = await os(
+      'PUT',
+      `/${config.healthIndex}`,
+      JSON.stringify({
+        settings: { 'index.number_of_shards': 1, 'index.number_of_replicas': 0 },
+        mappings: {
+          dynamic: false,
+          properties: {
+            updated_at: date, newest_entry: date, kept_from: date, cleared_at: date,
+            live: long, waiting: long, redis_entries: long, kept: long, rejected: long, retention_days: long,
+            data_mb: { type: 'float' },
+          },
+        },
+      }),
+    );
+    if (made.status !== 200 && !/resource_already_exists/.test(made.text)) {
+      throw new Error(`could not create ${config.healthIndex} (${made.status}): ${made.text.slice(0, 300)}`);
+    }
   }
 
   if ((await os('HEAD', `/${config.stateIndex}`)).status === 404) {
@@ -599,6 +625,33 @@ async function dataBytes() {
   return (Array.isArray(res.json) ? res.json : []).reduce((n, r) => n + Number(r['store.size'] || 0), 0);
 }
 
+let lastHealthAt = 0;
+/** Writes the health document the home dashboard shows; at most every 15 s (or right away when forced). */
+async function writeHealth(force = false) {
+  if (!force && Date.now() - lastHealthAt < config.healthEveryMs) return;
+  lastHealthAt = Date.now();
+  try {
+    const snap = statusSnapshot();
+    const count = await os('GET', `/${config.indexPrefix}*/_count`);
+    const doc = {
+      updated_at: new Date().toISOString(),
+      live: snap.ok && snap.lag === 0 ? 1 : 0,
+      waiting: snap.lag ?? 0,
+      redis_entries: snap.redis.length ?? 0,
+      kept: count.json ? count.json.count : 0,
+      rejected: state.rejected,
+      data_mb: Math.round(((await dataBytes()) / 1048576) * 10) / 10,
+      retention_days: config.retentionDays,
+      newest_entry: state.lastEntryTs,
+      kept_from: snap.kept_from,
+      cleared_at: snap.cleared_at,
+    };
+    await os('PUT', `/${config.healthIndex}/_doc/current`, JSON.stringify(doc));
+  } catch {
+    /* OpenSearch down: written next time */
+  }
+}
+
 // "Clear all trace data": runs between passes (never in the middle of a batch).
 let clearRequest = null;
 function requestClear() {
@@ -619,6 +672,7 @@ async function doClear() {
   await savePosition(true);
   state.skippedOld = 0;
   log(`cleared all trace data (${(freed / 1048576).toFixed(1)} MB); keeping only new entries from now on`);
+  await writeHealth(true);
   return { cleared_at: new Date(state.clearedAt).toISOString(), freed_bytes: freed };
 }
 
@@ -695,6 +749,7 @@ export async function run() {
       }
       const more = await pass(redis);
       if (!more) await enforceRetention();
+      await writeHealth();
       state.passes += 1;
       failures = 0;
       if (!more) await sleep(config.pollMs);
@@ -810,8 +865,11 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body, null, 2));
 }
 
+const HOME_DASHBOARD = 'astra-local-opensearch';
+const dashboardsUrl = () => `${env.DASHBOARDS_PUBLIC_URL || 'http://127.0.0.1:5601'}/app/dashboards#/view/${HOME_DASHBOARD}`;
+
 function startStatusServer() {
-  const page = fs.readFileSync(path.join(HERE, 'status.html'), 'utf8');
+  const clearPage = fs.readFileSync(path.join(HERE, 'clear.html'), 'utf8');
   http
     .createServer(async (req, res) => {
       const url = new URL(req.url, 'http://local');
@@ -853,9 +911,15 @@ function startStatusServer() {
           res.writeHead(204).end();
           return;
         }
-        if (url.pathname === '/') {
+        if (url.pathname === '/clear') {
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-          res.end(page);
+          res.end(clearPage.replaceAll('{{DASHBOARDS}}', dashboardsUrl()));
+          return;
+        }
+        if (url.pathname === '/') {
+          // everything is in OpenSearch Dashboards now
+          res.writeHead(302, { location: dashboardsUrl() });
+          res.end();
           return;
         }
         res.writeHead(404).end();

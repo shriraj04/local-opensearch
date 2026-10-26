@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { setupDashboards } from './dashboards.mjs';
+import { setupDashboards, HOME_DASHBOARD } from './dashboards.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dotenv = readDotEnv(path.join(ROOT, '.env'));
@@ -32,6 +32,23 @@ const SHIP_PORT = setting('SHIPPER_PORT', '9700');
 const OS = `http://127.0.0.1:${OS_PORT}`;
 const DASH = `http://127.0.0.1:${DASH_PORT}`;
 const SHIP = `http://127.0.0.1:${SHIP_PORT}`;
+const HOME = `${DASH}/app/dashboards#/view/${HOME_DASHBOARD}`;
+
+/** Sets up Dashboards with the kept period and the clear link from the running shipper. */
+async function provisionDashboards() {
+  const s = (await tryJson(`${SHIP}/status`))?.json;
+  await setupDashboards(DASH, { retentionDays: s?.retention_days ?? Number(setting('RETENTION_DAYS', '5')), clearUrl: `${SHIP}/clear` });
+}
+
+// Rison, as OpenSearch Dashboards reads its URL state.
+const rison = (v) => `'${String(v).replace(/!/g, '!!').replace(/'/g, "!'")}'`;
+function discoverUrl(dql, from = 'now-7d', to = 'now') {
+  const t = (v) => (v.startsWith('now') ? v : rison(v));
+  const a = '(discover:(columns:!(e_event,msg,level,uid,domain,p_key,p_value,entry_type),isDirty:!f,sort:!(!(ts,desc))),metadata:(indexPattern:nps-app,view:discover))';
+  const g = `(filters:!(),refreshInterval:(pause:!t,value:0),time:(from:${t(from)},to:${t(to)}))`;
+  const q = `(filters:!(),query:(language:kuery,query:${rison(dql)}))`;
+  return `${DASH}/app/data-explorer/discover#?_a=${encodeURIComponent(a)}&_g=${encodeURIComponent(g)}&_q=${encodeURIComponent(q)}`;
+}
 const IN_NETWORK_URL = 'http://astra-opensearch:9200';
 const WIRE_DIR = path.join(os.homedir(), '.config', 'astra-local', 'opensearch-wiring');
 const APPS = [
@@ -377,8 +394,8 @@ async function up({ fromSetup = false } = {}) {
     return s && s.status === 200 && s.json?.status?.overall?.state === 'green' ? s.json : null;
   }, 300_000, 3000);
   if (dash) {
-    await setupDashboards(DASH);
-    ok('Dashboards set up: index pattern nps-app-*, saved searches for every MNG trace screen');
+    await provisionDashboards();
+    ok('Dashboards set up: home dashboard, index pattern nps-app-*, saved searches for every MNG trace screen');
   } else warn('Dashboards is still starting; run `npm run up` again in a minute to finish setting it up.');
 
   await status({ short: true, hideWiring: fromSetup });
@@ -427,9 +444,7 @@ async function status({ short = false, hideWiring = false } = {}) {
   }
   const guardOn = run('systemctl', ['--user', 'is-active', `${GUARD}.timer`]).stdout.trim() === 'active';
   (guardOn ? ok : warn)(guardOn ? 'Background check: on (at login and every 10 minutes)' : 'Background check: off — turn it on with: npm run autostart');
-  console.log(`\n  Status & lookup page:   ${SHIP}`);
-  console.log(`  OpenSearch Dashboards:  ${DASH}/app/data-explorer/discover`);
-  console.log(`  OpenSearch API:         ${OS}`);
+  console.log(`\n  OpenSearch Dashboards (home):  ${HOME}`);
   if (!short) console.log('\n  Full check: npm run doctor');
 }
 
@@ -484,7 +499,7 @@ async function trace(args) {
   );
   const head = kind === 'internal-notes' ? ['ts (UTC)', 't_id', 'uid', 'note'] : ['ts (UTC)', 'e_event', 'level', 'uid', 'msg'];
   printTable(head, rows);
-  console.log(`\n  Page:       ${SHIP}/?${qs}`);
+  console.log(`\n  In Dashboards: ${discoverUrl(j.dql, j.params.from_date || 'now-7d', j.params.to_date || 'now')}`);
 }
 
 function printTable(head, rows) {
@@ -613,7 +628,11 @@ async function doctor() {
 
   console.log('\nDashboards');
   const ip = await tryJson(`${DASH}/api/saved_objects/index-pattern/nps-app`);
-  check(ip?.status === 200, `index pattern nps-app-* ready at ${DASH}`, 'Dashboards not set up — run: npm run up');
+  const homeDash = await tryJson(`${DASH}/api/saved_objects/dashboard/${HOME_DASHBOARD}`);
+  check(ip?.status === 200 && homeDash?.status === 200, `home dashboard and nps-app-* ready: ${HOME}`, 'Dashboards not set up — run: npm run up');
+  const health = await tryJson(`${OS}/astra-shipper-health/_doc/current`);
+  const age = health?.json?._source ? (Date.now() - Date.parse(health.json._source.updated_at)) / 1000 : null;
+  check(age !== null && age < 120, `health on the home dashboard is current (updated ${Math.round(age)} s ago)`, 'the home dashboard health is not being updated — run: npm run up');
 
   console.log(problems ? `\n✗ ${problems} problem(s) found.` : '\n✓ All good: local traces work end to end.');
   process.exitCode = problems ? 1 : 0;
@@ -844,8 +863,8 @@ async function setup() {
 You're all set!
 
   Try it in MNG:   open Transactions, then the "Transaction Trace" or "Add Internal Note" icon on any row
-  Dashboards:      ${DASH}   (same screen as mnops.cdmx.io, for your local data)
-  Quick lookup:    ${SHIP}
+  Dashboards:      ${HOME}
+                   (the same screens as mnops.cdmx.io, for your local data: health, trace searches, clear button)
 
 It starts by itself whenever your laptop starts, even after weeks off. To update later:  git pull --ff-only && npm run setup`);
 }
@@ -869,8 +888,8 @@ const commands = {
   logs: () => logs(args),
   trace: () => trace(args),
   dashboards: async () => {
-    await setupDashboards(DASH);
-    ok('Dashboards set up');
+    await provisionDashboards();
+    ok(`Dashboards set up: ${HOME}`);
   },
 };
 if (!commands[cmd]) {

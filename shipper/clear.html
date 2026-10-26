@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clear trace data</title>
+<style>
+  :root { --bg: #f6f7f9; --panel: #fff; --ink: #1d2330; --muted: #5d6677; --line: #e2e5ea; --bad: #b91c1c; --bad-bg: #fbe9e9; --ok: #15803d; --accent: #2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #12151b; --panel: #1a1e26; --ink: #e6e9ef; --muted: #9aa3b2; --line: #2b313c; --bad: #f87171; --bad-bg: #2d1717; --ok: #4ade80; --accent: #5b8cff; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 560px; margin: 10vh auto; padding: 0 16px; }
+  .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  p { color: var(--muted); margin: 8px 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; align-items: center; }
+  button { font: inherit; border: 0; border-radius: 8px; padding: 9px 16px; background: var(--bad); color: #fff; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  a { color: var(--accent); text-decoration: none; }
+  #msg { margin-top: 14px; font-weight: 600; }
+  .ok { color: var(--ok); } .err { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <div class="box">
+    <h1>Clear all local trace data?</h1>
+    <p>This deletes every log line kept in your local OpenSearch, to free disk space. The MNG trace screens and Dashboards start empty.</p>
+    <p>New log lines keep coming in as usual, and nothing old comes back. Days older than the kept period are also removed by themselves.</p>
+    <div class="row">
+      <button id="go" type="button">Yes, clear it</button>
+      <a href="{{DASHBOARDS}}">Cancel, back to Dashboards</a>
+    </div>
+    <div id="msg"></div>
+  </div>
+</main>
+<script>
+document.getElementById('go').addEventListener('click', async () => {
+  const b = document.getElementById('go');
+  const msg = document.getElementById('msg');
+  b.disabled = true; b.textContent = 'Clearing…';
+  try {
+    const r = await (await fetch('/api/clear', { method: 'POST' })).json();
+    if (r.error) throw new Error(r.error);
+    const mb = (r.freed_bytes / 1048576).toFixed(1);
+    msg.className = 'ok';
+    msg.innerHTML = `Cleared ${mb} MB. <a href="{{DASHBOARDS}}">Back to Dashboards</a>`;
+    b.textContent = 'Cleared';
+  } catch (err) {
+    msg.className = 'err';
+    msg.textContent = `Could not clear: ${err.message}`;
+    b.disabled = false; b.textContent = 'Yes, clear it';
+  }
+});
+</script>
+</body>
+</html>

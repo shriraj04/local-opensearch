@@ -63,8 +63,7 @@ Do all steps without stopping, unless a step says to ask. Then report as in "Rep
 - Anything that was already in place (repo, containers, wiring), so they know this run only re-checked it.
 - Links:
   - MNG: open a transaction's **Transaction Trace** or **Add Internal Note** icon.
-  - Dashboards: http://127.0.0.1:5601
-  - Lookup page: http://127.0.0.1:9700
+  - OpenSearch Dashboards (the one page): http://127.0.0.1:5601. It opens on the "ASTRA Local OpenSearch" home dashboard with health, links to every MNG trace search, the latest trace rows and the clear link.
 - How to undo after testing: "unwire opensearch" (or `npm run unwire`).
 - It starts by itself after every restart. The background check (`local-opensearch-guard`) repairs it at login and every 10 minutes.
 
@@ -80,10 +79,10 @@ Run these from `~/payment_system/local-opensearch`.
 | stop it | `npm run down` | it stays stopped, also after restarts, until "start it" |
 | start it again | `npm run up` | — |
 | update to the latest version | `git pull --ff-only && npm run setup -- --yes` (pull refused → see step 2) | — |
-| look up a trace | `npm run trace -- tx <id>` (also `notes <id>`, `account <id>`, `internal-notes <from> <to>`, `wl-trace <id>`) | the rows; the lookup page is http://127.0.0.1:9700 |
+| look up a trace | `npm run trace -- tx <id>` (also `notes <id>`, `account <id>`, `internal-notes <from> <to>`, `wl-trace <id>`) | the rows, plus a link that opens the same search in Dashboards |
 | see the shipper's log | `npm run logs` (or `npm run logs -- opensearch`) | — |
 | keep more / less history (default: last 5 days) | `echo "RETENTION_DAYS=10" >> .env && npm run up` (`0` = keep everything) | older days are removed by themselves |
-| free disk space now / "clear everything" | `npm run clear -- --yes`, only after they confirm, because it deletes all trace data. It is the same as the **Clear all trace data** button on http://127.0.0.1:9700. | how much was freed; new logs keep coming in |
+| free disk space now / "clear everything" | `npm run clear -- --yes`, only after they confirm, because it deletes all trace data. It is the same as the **Clear all trace data** link on the Dashboards home page. | how much was freed; new logs keep coming in |
 | turn the background check off / on | `npm run autostart:off` / `npm run autostart` | — |
 | remove it completely | **Ask first**, then `npm run remove -- --yes`. It unwires MNG and removes the containers, data, images (about 2.3 GB) and the background check. The repo folder stays; delete it only if they say so. | it is gone; `npm run setup` brings it back |
 

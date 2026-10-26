@@ -54,9 +54,8 @@ It takes about 10 minutes, once.
    You should see **"✓ All good: local traces work end to end."** Each ✗ line says what to do.
 6. **Use it.**
    - In MNG, open any transaction's Transaction Trace or Internal Notes, or an account's Account Trace.
-   - Dashboards: http://127.0.0.1:5601. It opens on Discover. Use **Open** to load the saved searches for each MNG screen.
-   - Quick lookup page: http://127.0.0.1:9700
-
+   - Dashboards: http://127.0.0.1:5601. It opens on the **ASTRA Local OpenSearch** home page with health, one-click trace searches, the latest trace rows and the clear link.
+   
 That's it. It starts by itself when your laptop starts, even after weeks off, and continues from where it stopped. A small background check repairs anything Docker cannot.
 
 ## Everyday commands
@@ -68,7 +67,7 @@ That's it. It starts by itself when your laptop starts, even after weeks off, an
 | Get the latest version | `git pull && npm run up` |
 | Stop it | `npm run down` (it stays stopped until `npm run up`) |
 | Turn the background check off / on | `npm run autostart:off` / `npm run autostart` |
-| Free disk space now | **Clear all trace data** on http://127.0.0.1:9700, or `npm run clear` (days older than 5 are removed by themselves anyway) |
+| Free disk space now | the **Clear all trace data** link on the Dashboards home page, or `npm run clear` (days older than 5 are removed by themselves anyway) |
 | Remove it completely | `npm run remove` (asks first; frees about 2.3 GB) |
 | Undo the MNG change | `npm run unwire` (puts the original config files back exactly) |
 

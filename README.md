@@ -52,7 +52,7 @@ The heaviest moment is reading the whole Redis list again, after a restart for e
 
 Each log line takes about 250 bytes. n8n's scheduled jobs alone write about 6,000 lines an hour (the processor-status cron writes about 1,000 lines every 10 minutes). So the shipper keeps only the **last 5 days** (today plus the 4 days before) and removes older days by itself, which is usually a few MB in total. Change it with `RETENTION_DAYS` in `.env` (`0` = keep everything), then run `npm run up`.
 
-- **Free space right now:** the **Clear all trace data** button on http://127.0.0.1:9700, or `npm run clear`. It deletes all trace data at once; new log lines keep coming in, and nothing old comes back from Redis.
+- **Free space right now:** the **Clear all trace data** link on the Dashboards home page, or `npm run clear`. It deletes all trace data at once; new log lines keep coming in, and nothing old comes back from Redis.
 - **Remove everything** (data, containers, background check and the Docker images, about 2.3 GB, the biggest part): `npm run remove`. It asks first, and also puts MNG's original config back.
 
 These lines appear even when nobody is logged in: n8n's crons run all the time, and every MNG page request (even the login page) is logged with `uid 0`.
@@ -73,7 +73,7 @@ It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN,
 | `npm run setup` | First-time setup in one go: checks the laptop (each ✗ says how to fix it), starts everything, asks before connecting MNG / WL-MNG, then runs the doctor. Safe to run again. |
 | `npm run up` | Starts OpenSearch, Dashboards and the log shipper (or updates them), waits until everything in Redis is copied, and sets up Dashboards. Safe to run again. |
 | `npm run status` | Whether everything is running, how many entries are copied, and whether MNG is wired. |
-| `npm run doctor` | Full check. It finds entries sampled from Redis in OpenSearch, checks that MNG can reach OpenSearch, and runs the Transaction Trace query with **MNG's own code inside the MNG container**, comparing the result with the status page. |
+| `npm run doctor` | Full check. It finds entries sampled from Redis in OpenSearch, checks that MNG can reach OpenSearch, and runs the Transaction Trace query with **MNG's own code inside the MNG container**, comparing the result with the same query run by the shipper. |
 | `npm run wire` | Sets `OPS_URL` in `mng/app/config/config.json` and `wl-mng/app/config/config.json` to `http://astra-opensearch:9200`. Nothing else in those files changes. The original files are saved in `~/.config/astra-local/opensearch-wiring/`. The portals restart by themselves. |
 | `npm run unwire` | Puts the original files back byte for byte. If someone edited a file since, only `OPS_URL` is put back and their edits are kept. |
 | `npm run trace -- tx 189444` | Transaction Trace for a transaction, in the terminal. Also `notes 189444`, `account 140`, `internal-notes 2026-10-01 2026-10-23`, `wl-trace 189444`. |
@@ -81,19 +81,20 @@ It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN,
 | `npm run down` | Stops the containers. The data is kept, and it stays stopped (also after a reboot) until `npm run up`. |
 | `npm run autostart` / `autostart:off` | Turns the background check on or off: at login and every 10 minutes it repairs a removed container or a lost network. Its log: `journalctl --user -u local-opensearch-guard`. |
 | `npm run ensure` | Runs that check once, now. |
-| `npm run clear` | Deletes all trace data now, to free disk space (the same as the **Clear all trace data** button on the status page). New log lines keep coming in. Older days are also removed by themselves after 5 days. |
+| `npm run clear` | Deletes all trace data now, to free disk space (the same as the **Clear all trace data** link on the Dashboards home page). New log lines keep coming in. Older days are also removed by themselves after 5 days. |
 | `npm run remove` | Removes everything it put on the laptop: puts MNG's config back, deletes the containers, data, Docker images (about 2.3 GB) and the background check. It asks first. |
 | `npm test` | Unit tests. |
 
-## Pages
+## The page
 
-| Page | Link |
-| --- | --- |
-| Status & lookup | http://127.0.0.1:9700. Health and counts, plus **Look up a trace**: type a transaction or account id and you get the rows MNG's screen would get, with a link to open them in Dashboards. |
-| OpenSearch Dashboards | http://127.0.0.1:5601. It opens on Discover, index pattern `nps-app-*`, last 7 days. **Open › saved searches** has one per MNG screen ("MNG Transaction Trace", "MNG Account Trace", …). Add `and p_value:"<id>"` to the query. |
-| OpenSearch API | http://127.0.0.1:9200 |
+Everything is in **OpenSearch Dashboards**, at http://127.0.0.1:5601 (127.0.0.1 only). It opens on the **ASTRA Local OpenSearch** home dashboard, which refreshes every 30 s:
 
-All three listen on 127.0.0.1 only.
+- **Health:** log lines waiting to be shipped (0 = live), log lines kept, trace data on disk, rejected entries, and when the health was last updated.
+- **Links to one search per MNG screen:** MNG Transaction Trace, Notes, Account Trace, the Internal Notes report, the WL-MNG trace, errors and n8n. Add `and p_value:"<id>"` for one transaction or account.
+- **The latest Transaction Trace rows.**
+- **Clear all trace data:** opens a small confirmation page, then empties the data. New log lines keep coming in.
+
+The shipper's own address (`127.0.0.1:9700`) is only a background API for the CLI, plus that confirmation page; opening it takes you to Dashboards. To run MNG's exact query code from the terminal, use `npm run trace -- tx <id>`.
 
 ## How close is it to Alpha / Omega?
 
@@ -101,7 +102,7 @@ All three listen on 127.0.0.1 only.
 - **Documents:** each document is the Redis entry exactly as the app wrote it, plus `@timestamp`, like on `mnops.cdmx.io`.
 - **Indices:** `nps-app-*`, like remote. Locally there is one per day (`nps-app-YYYY.MM.DD`) instead of one per month, so old days can be dropped cheaply; MNG searches all indices, so this makes no difference.
 - **Field types:** text fields are `keyword`, as on remote. That is why MNG's `terms` filter on `entry_type` works and why `domain` / `git_version` can be aggregated without `.keyword`. `ts` and `@timestamp` are dates.
-- **Queries:** MNG and WL-MNG run their own unchanged code (`opensearch-query.js`) against it. The status page and `npm run trace` also run that module, with the options from the action files of the branch that is checked out.
+- **Queries:** MNG and WL-MNG run their own unchanged code (`opensearch-query.js`) against it. `npm run trace` also run that module, with the options from the action files of the branch that is checked out.
 - **Cross-tenant rows:** all local tenants (Alpha, Omega, white-labels) share one cluster, just as remote environments share one. So behaviour like an account's trace listing rows from another environment with the same id (PRE-03) shows up locally too.
 
 **Different, on purpose:**
