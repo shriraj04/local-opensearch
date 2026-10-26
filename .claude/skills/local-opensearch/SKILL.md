@@ -82,6 +82,7 @@ Run these from `~/payment_system/local-opensearch`.
 | update to the latest version | `git pull --ff-only && npm run setup -- --yes` (pull refused → see step 2) | — |
 | look up a trace | `npm run trace -- tx <id>` (also `notes <id>`, `account <id>`, `internal-notes <from> <to>`, `wl-trace <id>`) | the rows; the lookup page is http://127.0.0.1:9700 |
 | see the shipper's log | `npm run logs` (or `npm run logs -- opensearch`) | — |
+| keep more / less history (default: 3 months) | `echo "RETENTION_MONTHS=6" >> .env && npm run up` (`0` = keep everything) | each month of traces is a few hundred MB at most |
 | turn the background check off / on | `npm run autostart:off` / `npm run autostart` | — |
 | remove it completely | `npm run unwire`, `npm run autostart:off`, `npm run down`. Then **ask first** before `docker compose down -v` (deletes all trace history) and before deleting the folder | — |
 
@@ -96,6 +97,7 @@ Run these from `~/payment_system/local-opensearch`.
 | Image download keeps failing ("unexpected EOF", stops at the same point) | The office gateway is cutting it. Retry once. If it still fails, ask Shriraj for the ready-made image (`docker load -i …`). Do not try to get around the gateway. |
 | MNG trace / notes screen shows an error | `npm run status`: containers ✓ and `mng: wired`? If not wired → `npm run wire`; if containers ✗ → `npm run up`. |
 | New log rows don't appear in MNG | `npm run status` should say "Shipper: live". Otherwise `npm run logs`. Rows normally appear within about 2 s. |
+| "Logs appear although nobody logged in" | Normal: n8n's crons log all day (about 1,000 lines every 10 minutes from the processor-status cron), and MNG logs every page request, even the login page, with `uid 0`. |
 | The Internal Notes **report** is empty | Expected, product issue: the report filters on `is_note` / `t_id`, which MNG stopped writing in ASTRA-5487. The tool is not at fault. |
 | doctor: "documents are no longer in the Redis list" | Fine: kept history after Redis was flushed or trimmed. |
 

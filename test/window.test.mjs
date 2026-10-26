@@ -150,3 +150,14 @@ test('the exact check agrees, also while entries are being pushed', { skip }, as
   assert.equal(p.not_in_redis, 0);
   assert.equal(p.redis_entries, await redis.llen(KEY));
 });
+
+test('entries older than the retention are not shipped, and the exact check agrees', { skip }, async () => {
+  const old = JSON.stringify({ ts: '2020-01-01T00:00:00.000Z', e_event: 'ANCIENT' });
+  await reset([entry(1, 'a'), old, entry(2, 'b')]);
+  await drain();
+  assert.equal(store.size, 2);
+  assert.ok(state.skippedOld >= 1);
+  const p = await parity();
+  assert.equal(p.missing_in_opensearch, 0);
+  assert.equal(p.not_in_redis, 0);
+});

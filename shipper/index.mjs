@@ -28,6 +28,9 @@ export const config = {
   // the whole list. Kept in OpenSearch itself: if the data is wiped, the position goes with it.
   stateIndex: env.STATE_INDEX || 'astra-shipper-state',
   saveEveryMs: Number(env.SAVE_EVERY_MS || 2000),
+  // Keep this many months of traces (the current month included); older monthly indices are dropped.
+  // n8n's crons alone write ~6,000 lines an hour, so without a limit the data grows a few GB a year. 0 = keep all.
+  retentionMonths: Number(env.RETENTION_MONTHS ?? 3),
   templateName: 'nps-app',
   batchSize: Number(env.BATCH_SIZE || 500),
   maxBatchBytes: Number(env.MAX_BATCH_BYTES || 8 * 1024 * 1024),
@@ -121,13 +124,31 @@ export function toDocument(raw, nowMs, cfg = config) {
   // escaped), so folding it keeps the entry identical while keeping the bulk body one line per doc.
   const oneLine = raw.trim().replace(/[\r\n\u2028\u2029]+/g, ' ');
   if (Object.prototype.hasOwnProperty.call(entry, '@timestamp')) {
-    return { ok: true, index, body: oneLine };
+    return { ok: true, index, body: oneLine, tsMs: hasTs ? tsMs : null };
   }
   const live = !hasTs || Math.abs(nowMs - tsMs) <= cfg.liveWindowMs;
   const stamp = JSON.stringify(live ? new Date(nowMs).toISOString() : entry.ts);
   const rest = oneLine.slice(1).trimStart();
   const body = rest.startsWith('}') ? `{"@timestamp":${stamp}}` : `{"@timestamp":${stamp},${rest}`;
-  return { ok: true, index, body };
+  return { ok: true, index, body, tsMs: hasTs ? tsMs : null };
+}
+
+/** Start of the oldest month kept (UTC), or null to keep everything. */
+export function retentionCutoff(months = config.retentionMonths, nowMs = Date.now()) {
+  if (!months || months < 1) return null;
+  const d = new Date(nowMs);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - (months - 1), 1);
+}
+
+/** True for an entry older than what is kept (entries without a valid ts are always kept). */
+export function tooOld(raw, cutoff = retentionCutoff()) {
+  if (cutoff === null) return false;
+  try {
+    const ms = Date.parse(JSON.parse(raw).ts);
+    return Number.isFinite(ms) && ms < cutoff;
+  } catch {
+    return false;
+  }
 }
 
 // ---------- OpenSearch ----------
@@ -222,6 +243,7 @@ export const state = {
   fallback: 0,
   rejected: 0,
   resyncs: 0,
+  skippedOld: 0,
   lastShippedAt: null,
   lastEntryTs: null,
   redisOk: false,
@@ -298,6 +320,7 @@ async function resume() {
 
 async function shipBatch(entries, listIndexOf) {
   const now = Date.now();
+  const cutoff = retentionCutoff(config.retentionMonths, now);
   const lines = [];
   const meta = [];
   const rejects = [];
@@ -306,6 +329,10 @@ async function shipBatch(entries, listIndexOf) {
     const listIndex = listIndexOf(i);
     const id = docId(raw, copies.next(raw));
     const doc = toDocument(raw, now);
+    if (doc.ok && cutoff !== null && doc.tsMs !== null && doc.tsMs < cutoff) {
+      state.skippedOld += 1;
+      return;
+    }
     if (!doc.ok) {
       rejects.push({ raw, listIndex, id, index: null, reason: doc.reason });
       return;
@@ -522,6 +549,26 @@ async function pass(redis) {
   return true;
 }
 
+let lastRetentionAt = 0;
+/** Drops monthly indices (and their -fallback) older than the retention; at start and every 6 hours. */
+async function enforceRetention(force = false) {
+  const cutoff = retentionCutoff();
+  if (cutoff === null || (!force && Date.now() - lastRetentionAt < 6 * 3600_000)) return;
+  lastRetentionAt = Date.now();
+  try {
+    const res = await os('GET', `/_cat/indices/${config.indexPrefix}*?format=json&h=index`);
+    for (const { index } of Array.isArray(res.json) ? res.json : []) {
+      const m = index.slice(config.indexPrefix.length).match(/^(\d{4})\.(\d{2})(-fallback)?$/);
+      if (m && Date.UTC(Number(m[1]), Number(m[2]) - 1, 1) < cutoff) {
+        const del = await os('DELETE', `/${index}`);
+        log(`retention (${config.retentionMonths} months): removed ${index} (${del.status})`);
+      }
+    }
+  } catch (err) {
+    noteError(`retention clean-up: ${err.message}`);
+  }
+}
+
 async function waitForOpenSearch() {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -563,6 +610,7 @@ export async function run() {
   startStatusServer();
   log(`shipping redis://${config.redisHost}:${config.redisPort}/${config.redisDb} list "${config.listKey}" → ${config.opensearchUrl} ${config.indexPrefix}YYYY.MM`);
   await waitForOpenSearch();
+  await enforceRetention(true);
   for (let attempt = 0; ; attempt += 1) {
     try {
       await resume();
@@ -584,6 +632,7 @@ export async function run() {
   while (!stopping) {
     try {
       const more = await pass(redis);
+      if (!more) await enforceRetention();
       state.passes += 1;
       failures = 0;
       if (!more) await sleep(config.pollMs);
@@ -622,6 +671,8 @@ export function statusSnapshot() {
     in_fallback: state.fallback,
     rejected: state.rejected,
     resyncs: state.resyncs,
+    retention_months: config.retentionMonths,
+    skipped_older_than_retention: state.skippedOld,
     dashboards_url: env.DASHBOARDS_PUBLIC_URL || 'http://127.0.0.1:5601',
     last_shipped_at: state.lastShippedAt,
     last_entry_ts: state.lastEntryTs,
@@ -649,7 +700,10 @@ async function parity() {
         const r = await step(redis, w, 5000, 32 * 1024 * 1024);
         if (r.k === -1) break; // list replaced under us: start again
         advance(w, r);
-        for (const raw of r.entries) ids.add(docId(raw, counter.next(raw)));
+        for (const raw of r.entries) {
+          const id = docId(raw, counter.next(raw));
+          if (!tooOld(raw)) ids.add(id);
+        }
         if (r.side === 0) {
           expected = ids;
           length = r.len;

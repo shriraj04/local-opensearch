@@ -69,6 +69,7 @@ services:
     environment:
       - NODE_OPTIONS=--max-old-space-size=192
       - POLL_MS=400
+      - RETENTION_MONTHS=${RETENTION_MONTHS:-3}
       - REDIS_HOST=${REDIS_HOST:-nps_redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
       - REDIS_DB=${REDIS_DB:-0}

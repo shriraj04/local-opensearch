@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { toDocument, docId, CopyCounter, monthIndex } from '../shipper/index.mjs';
+import { toDocument, docId, CopyCounter, monthIndex, retentionCutoff, tooOld } from '../shipper/index.mjs';
 import { makeParser, LOOKUPS } from '../shipper/mng-query.mjs';
 
 const cfg = { indexPrefix: 'nps-app-', liveWindowMs: 5000 };
@@ -133,4 +133,18 @@ test('Wappler expressions resolve like MNG', () => {
   assert.throws(() => parse('{{logs.length}}'));
   assert.throws(() => parse('{{logs}}'));
   assert.throws(() => parse('id {{x}}'));
+});
+
+test('retention keeps whole months: the current one plus the ones before it', () => {
+  const now = Date.parse('2026-10-26T05:00:00Z');
+  assert.equal(new Date(retentionCutoff(3, now)).toISOString(), '2026-08-01T00:00:00.000Z');
+  assert.equal(new Date(retentionCutoff(1, now)).toISOString(), '2026-10-01T00:00:00.000Z');
+  assert.equal(new Date(retentionCutoff(14, now)).toISOString(), '2025-09-01T00:00:00.000Z');
+  assert.equal(retentionCutoff(0, now), null);
+  const cutoff = retentionCutoff(3, now);
+  assert.equal(tooOld('{"ts":"2026-07-31T23:59:59.999Z"}', cutoff), true);
+  assert.equal(tooOld('{"ts":"2026-08-01T00:00:00.000Z"}', cutoff), false);
+  assert.equal(tooOld('{"msg":"no ts"}', cutoff), false);
+  assert.equal(tooOld('not json', cutoff), false);
+  assert.equal(tooOld('{"ts":"2020-01-01T00:00:00Z"}', null), false);
 });

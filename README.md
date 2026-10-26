@@ -48,6 +48,12 @@ Each container has a CPU and memory ceiling, so it can never take over the lapto
 
 The heaviest moment is reading the whole Redis list again, after a restart for example. That is about 77,000 entries, done in about 3 seconds at about 1 CPU. Change the limits in `.env` (`OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, `OPENSEARCH_HEAP`, …) if needed.
 
+### How much disk it uses
+
+Each log line takes about 250 bytes. n8n's scheduled jobs alone write about 6,000 lines an hour (the processor-status cron writes about 1,000 lines every 10 minutes), so expect roughly 10–15 MB per working day. To keep this bounded, the shipper keeps the **last 3 months** (the current month plus the two before it) and drops older monthly indices by itself. Change it with `RETENTION_MONTHS` in `.env` (`0` = keep everything), then `npm run up`.
+
+These lines appear even when nobody is logged in: n8n's crons run all the time, and every MNG page request (even the login page) is logged with `uid 0`.
+
 ### Why OpenSearch is built locally
 
 The office web gateway (Cloudflare WARP) cuts the download of the Java runtime bundled inside the official OpenSearch image and tarballs. The download always stops in `jdk/jmods/java.base.jmod`. So `npm run up` instead builds the image from:
