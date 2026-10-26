@@ -1,6 +1,6 @@
 // Ships the ASTRA log list (Redis `nps-logs`) into the local OpenSearch, the way the remote
-// shipper fills nps-app-* on mnops.cdmx.io: every entry as it is, plus @timestamp, into a monthly
-// index nps-app-YYYY.MM.
+// shipper fills nps-app-* on mnops.cdmx.io: every entry as it is, plus @timestamp, into a daily
+// index nps-app-YYYY.MM.DD (remote: one per month).
 //
 // Read-only on Redis: LLEN / LINDEX / LRANGE, never LPOP. The Redis Log Viewer and anything else
 // reading the list keep working. Re-reading the list is harmless: every entry has a fixed _id, so an
@@ -256,7 +256,7 @@ async function ensureIndexSetup() {
   }
 }
 
-// ---------- state shown on the status page ----------
+// ---------- shipper state (shown at /status and on the home dashboard) ----------
 //
 // The list grows at BOTH ends: the portals RPUSH (tail) and n8n's Redis "push" node LPUSHes (head).
 // What is shipped is always one window [a, b) of the list. Entries n8n pushes appear before `a` (and move
@@ -381,7 +381,7 @@ async function shipBatch(entries, listIndexOf) {
     meta.push({ raw, listIndex, id, index: doc.index });
   });
 
-  // First the monthly index; an entry it refuses (e.g. a value too long to index inside aux) goes,
+  // First the daily index; an entry it refuses (e.g. a value too long to index inside aux) goes,
   // unchanged, to <index>-fallback where aux is stored but not indexed; only if that refuses too is it
   // recorded as rejected.
   let pending = lines.length ? { lines, meta } : null;
@@ -718,7 +718,7 @@ export async function run() {
   log(`shipping redis://${config.redisHost}:${config.redisPort}/${config.redisDb} list "${config.listKey}" → ${config.opensearchUrl} ${config.indexPrefix}YYYY.MM.DD`);
   await waitForOpenSearch();
   await migrateFromMonthly().catch((err) => noteError(`switching to daily indices: ${err.message}`));
-  // newest entry already stored (for the status page after a restart)
+  // newest entry already stored (for /status and the home dashboard after a restart)
   const newest = await os('POST', `/${config.indexPrefix}*/_search`, JSON.stringify({ size: 0, aggs: { t: { max: { field: 'ts' } } } })).catch(() => null);
   state.lastEntryTs = newest?.json?.aggregations?.t?.value_as_string || null;
   await enforceRetention(true);
@@ -772,7 +772,7 @@ export async function run() {
   process.exit(0);
 }
 
-// ---------- status page (http://127.0.0.1:9700) ----------
+// ---------- background API (127.0.0.1:9700): /status, /api/*, /clear; "/" goes to the Dashboards home ----------
 
 export function statusSnapshot() {
   const lag = state.listLength === null ? null : Math.max(0, state.listLength - shippedCount());

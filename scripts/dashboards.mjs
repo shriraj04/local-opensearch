@@ -1,6 +1,6 @@
 // Sets up OpenSearch Dashboards the same way every time (safe to run again). Dashboards is the one page:
 // it opens on the "ASTRA Local OpenSearch" home dashboard (health, links to every MNG-style trace search,
-// the latest trace rows, the clear link), plus the nps-app-* index pattern used on mnops.cdmx.io and one
+// the latest trace rows, the red clear button), plus the nps-app-* index pattern used on mnops.cdmx.io and one
 // saved search per MNG trace screen.
 
 const COLUMNS = ['e_event', 'msg', 'level', 'uid', 'domain', 'p_key', 'p_value', 'entry_type'];
@@ -76,6 +76,85 @@ const markdown = (id, title, text) => ({
   references: [],
 });
 
+/**
+ * The "Clear all trace data" button. Plain Markdown panels strip all styling, and a destructive action must
+ * stand out (red, bold, high contrast), so this is a small static Vega panel: no data query, SVG renderer
+ * (the button is a real link), red #BD271E with bold white text (contrast 6:1), darker on hover.
+ */
+function clearButton(clearUrl) {
+  const spec = {
+    $schema: 'https://vega.github.io/schema/vega/v5.json',
+    config: { kibana: { renderer: 'svg' } },
+    autosize: { type: 'fit', contains: 'padding' },
+    padding: 6,
+    marks: [
+      {
+        type: 'rect',
+        name: 'clear',
+        encode: {
+          enter: {
+            x: { signal: 'width / 2 - 150' },
+            y: { value: 2 },
+            width: { value: 300 },
+            height: { value: 46 },
+            cornerRadius: { value: 6 },
+            cursor: { value: 'pointer' },
+            href: { value: clearUrl },
+            tooltip: { value: 'Opens a confirmation page first' },
+          },
+          update: { fill: { value: '#BD271E' } },
+          hover: { fill: { value: '#98201A' } },
+        },
+      },
+      {
+        type: 'text',
+        interactive: false,
+        encode: {
+          enter: {
+            x: { signal: 'width / 2' },
+            y: { value: 25 },
+            align: { value: 'center' },
+            baseline: { value: 'middle' },
+            text: { value: 'CLEAR ALL TRACE DATA' },
+            fill: { value: '#FFFFFF' },
+            fontWeight: { value: 'bold' },
+            fontSize: { value: 17 },
+          },
+        },
+      },
+      {
+        type: 'text',
+        interactive: false,
+        encode: {
+          enter: {
+            x: { signal: 'width / 2' },
+            y: { value: 66 },
+            align: { value: 'center' },
+            baseline: { value: 'middle' },
+            text: { value: 'Deletes all local trace data now (asks first). New log lines keep coming in.' },
+            fill: { value: '#98201A' },
+            fontWeight: { value: 'bold' },
+            fontSize: { value: 12 },
+          },
+        },
+      },
+    ],
+  };
+  return {
+    type: 'visualization',
+    id: 'home-clear',
+    attributes: {
+      title: 'Free disk space',
+      description: '',
+      uiStateJSON: '{}',
+      version: 1,
+      visState: JSON.stringify({ title: 'Free disk space', type: 'vega', aggs: [], params: { spec: JSON.stringify(spec, null, 2) } }),
+      kibanaSavedObjectMeta: { searchSourceJSON: searchSource('', false) },
+    },
+    references: [],
+  };
+}
+
 function guide({ retentionDays, clearUrl }) {
   const open = (id) => `/app/discover#/view/${id}`;
   const keep = retentionDays ? `the last **${retentionDays} days**` : '**everything**';
@@ -94,9 +173,7 @@ Log lines from your local ASTRA (portals + n8n, via Redis \`nps-logs\`), like \`
 
 For one transaction, add \`and p_value:"189444"\` to the query bar (account: the account id).
 
-**Health:** *Health updated* should be under a minute ago and *Waiting to be shipped* 0. Otherwise run \`npm run doctor\`.
-
-**Free disk space:** [Clear all trace data](${clearUrl}). It asks first; new log lines keep coming in.`;
+Healthy = *Health updated* under a minute ago and *Waiting to be shipped* 0 (else: \`npm run doctor\`).`;
 }
 
 export async function setupDashboards(base, { retentionDays = 5, clearUrl = 'http://127.0.0.1:9700/clear' } = {}) {
@@ -118,7 +195,8 @@ export async function setupDashboards(base, { retentionDays = 5, clearUrl = 'htt
   };
 
   const panels = [
-    ['home-guide', 'visualization', { x: 0, y: 0, w: 20, h: 22 }],
+    ['home-guide', 'visualization', { x: 0, y: 0, w: 20, h: 16 }],
+    ['home-clear', 'visualization', { x: 0, y: 16, w: 20, h: 6 }],
     ['home-health', 'visualization', { x: 20, y: 0, w: 28, h: 11 }],
     ['home-times', 'visualization', { x: 20, y: 11, w: 28, h: 11 }],
     ['mng-transaction-trace', 'search', { x: 0, y: 22, w: 48, h: 20 }],
@@ -155,6 +233,7 @@ export async function setupDashboards(base, { retentionDays = 5, clearUrl = 'htt
     { type: 'index-pattern', id: 'astra-shipper-health', attributes: { title: 'astra-shipper-health', ...(await fieldsOf('astra-shipper-health')) } },
     ...SEARCHES.map(search),
     markdown('home-guide', 'How to use', guide({ retentionDays, clearUrl })),
+    clearButton(clearUrl),
     metric('home-health', 'Health', [
       ['waiting', 'Waiting to be shipped'],
       ['kept', 'Log lines kept'],

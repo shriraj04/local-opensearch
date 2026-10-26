@@ -52,7 +52,7 @@ The heaviest moment is reading the whole Redis list again, after a restart for e
 
 Each log line takes about 250 bytes. n8n's scheduled jobs alone write about 6,000 lines an hour (the processor-status cron writes about 1,000 lines every 10 minutes). So the shipper keeps only the **last 5 days** (today plus the 4 days before) and removes older days by itself, which is usually a few MB in total. Change it with `RETENTION_DAYS` in `.env` (`0` = keep everything), then run `npm run up`.
 
-- **Free space right now:** the **Clear all trace data** link on the Dashboards home page, or `npm run clear`. It deletes all trace data at once; new log lines keep coming in, and nothing old comes back from Redis.
+- **Free space right now:** the red **Clear all trace data** button on the Dashboards home page, or `npm run clear`. It deletes all trace data at once; new log lines keep coming in, and nothing old comes back from Redis.
 - **Remove everything** (data, containers, background check and the Docker images, about 2.3 GB, the biggest part): `npm run remove`. It asks first, and also puts MNG's original config back.
 
 These lines appear even when nobody is logged in: n8n's crons run all the time, and every MNG page request (even the login page) is logged with `uid 0`.
@@ -81,7 +81,7 @@ It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN,
 | `npm run down` | Stops the containers. The data is kept, and it stays stopped (also after a reboot) until `npm run up`. |
 | `npm run autostart` / `autostart:off` | Turns the background check on or off: at login and every 10 minutes it repairs a removed container or a lost network. Its log: `journalctl --user -u local-opensearch-guard`. |
 | `npm run ensure` | Runs that check once, now. |
-| `npm run clear` | Deletes all trace data now, to free disk space (the same as the **Clear all trace data** link on the Dashboards home page). New log lines keep coming in. Older days are also removed by themselves after 5 days. |
+| `npm run clear` | Deletes all trace data now, to free disk space (the same as the red **Clear all trace data** button on the Dashboards home page). New log lines keep coming in. Older days are also removed by themselves after 5 days. |
 | `npm run remove` | Removes everything it put on the laptop: puts MNG's config back, deletes the containers, data, Docker images (about 2.3 GB) and the background check. It asks first. |
 | `npm test` | Unit tests. |
 
@@ -92,7 +92,7 @@ Everything is in **OpenSearch Dashboards**, at http://127.0.0.1:5601 (127.0.0.1 
 - **Health:** log lines waiting to be shipped (0 = live), log lines kept, trace data on disk, rejected entries, and when the health was last updated.
 - **Links to one search per MNG screen:** MNG Transaction Trace, Notes, Account Trace, the Internal Notes report, the WL-MNG trace, errors and n8n. Add `and p_value:"<id>"` for one transaction or account.
 - **The latest Transaction Trace rows.**
-- **Clear all trace data:** opens a small confirmation page, then empties the data. New log lines keep coming in.
+- **Clear all trace data:** a red button that opens a small confirmation page, then empties the data. New log lines keep coming in. (It is a Vega panel, the only panel type that can be styled; for its link Dashboards runs with `VEGA_ENABLEEXTERNALURLS=true`, local only.)
 
 The shipper's own address (`127.0.0.1:9700`) is only a background API for the CLI, plus that confirmation page; opening it takes you to Dashboards. To run MNG's exact query code from the terminal, use `npm run trace -- tx <id>`.
 

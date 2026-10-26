@@ -48,6 +48,8 @@ services:
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
       - SERVER_NAME=astra-local-opensearch
       - NODE_OPTIONS=--max-old-space-size=512
+      # lets the red "Clear all trace data" button (a Vega panel) open the shipper's confirmation page
+      - VEGA_ENABLEEXTERNALURLS=true
     cpus: ${DASHBOARDS_CPUS:-1.0}
     mem_limit: ${DASHBOARDS_MEM_LIMIT:-1g}
     logging: *logging

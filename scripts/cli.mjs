@@ -34,7 +34,7 @@ const DASH = `http://127.0.0.1:${DASH_PORT}`;
 const SHIP = `http://127.0.0.1:${SHIP_PORT}`;
 const HOME = `${DASH}/app/dashboards#/view/${HOME_DASHBOARD}`;
 
-/** Sets up Dashboards with the kept period and the clear link from the running shipper. */
+/** Sets up Dashboards with the kept period and the clear button's link from the running shipper. */
 async function provisionDashboards() {
   const s = (await tryJson(`${SHIP}/status`))?.json;
   await setupDashboards(DASH, { retentionDays: s?.retention_days ?? Number(setting('RETENTION_DAYS', '5')), clearUrl: `${SHIP}/clear` });
@@ -433,7 +433,7 @@ async function status({ short = false, hideWiring = false } = {}) {
     }
     (j.rejected ? warn : ok)(`Rejected by OpenSearch: ${fmt(j.rejected)}${j.rejected ? ' (kept in astra-shipper-rejected)' : ''}`);
     if (j.last_error && (!j.redis.connected || !j.opensearch.reachable)) info(`last error: ${j.last_error}`);
-  } else bad(`Shipper status page not reachable at ${SHIP}`);
+  } else bad(`Shipper not reachable at ${SHIP}`);
 
   console.log('');
   for (const { app } of hideWiring ? [] : APPS) {
@@ -621,8 +621,8 @@ async function doctor() {
     const page = await tryJson(`${SHIP}/api/lookup?kind=tx-trace&tx_id=${encodeURIComponent(txId)}`, { timeout: 60_000 });
     check(
       Number.isFinite(insideRows) && insideRows > 0 && page?.json?.count === insideRows,
-      `Transaction Trace of tx ${txId}: ${insideRows} rows from MNG's own code inside nps_admin_web = ${page?.json?.count} on the status page`,
-      `Transaction Trace of tx ${txId}: MNG container ${inside.stdout.trim() || inside.stderr.trim().slice(0, 160)}, status page ${page?.json?.count ?? page?.json?.error}`,
+      `Transaction Trace of tx ${txId}: ${insideRows} rows from MNG's own code inside nps_admin_web = ${page?.json?.count} from the shipper`,
+      `Transaction Trace of tx ${txId}: MNG container ${inside.stdout.trim() || inside.stderr.trim().slice(0, 160)}, shipper ${page?.json?.count ?? page?.json?.error}`,
     );
   } else warn('no transaction trace rows in OpenSearch yet — create a transaction locally, then run doctor again');
 
