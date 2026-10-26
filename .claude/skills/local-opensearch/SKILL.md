@@ -19,7 +19,7 @@ Local OpenSearch copies every log line the local ASTRA apps write to Redis `nps-
    - If the user's own instructions (a CLAUDE.md, a working agreement) say app configs must not be changed without their say-so, ask before wiring: run setup **without** `--yes`, then `npm run wire` once they agree. Asking for setup "and connect my MNG" counts as that say-so.
 3. **Never print or `cat` those config files.** They contain secrets. `npm run status` shows whether they are connected.
 4. **Never restart, rebuild or modify the ASTRA containers** (`nps_*`). Never touch product code, the database or n8n. MNG restarts by itself when the config changes.
-5. **Never delete Docker volumes or images** unless the user explicitly asks; volume `astra-opensearch-data` holds the trace history.
+5. **Never delete trace data, Docker volumes or images** (`npm run clear`, `npm run remove`, `docker … down -v`) unless the user explicitly asks for it.
 6. **Don't try to get around the office web gateway** (Cloudflare WARP). It blocks Java downloads; the setup already avoids them.
 7. **Long-running commands:** the first `npm run setup` takes 3–10 minutes. Run it with the longest timeout available, or in the background. If it is cut off, run it again; it continues where it stopped.
 
@@ -82,9 +82,10 @@ Run these from `~/payment_system/local-opensearch`.
 | update to the latest version | `git pull --ff-only && npm run setup -- --yes` (pull refused → see step 2) | — |
 | look up a trace | `npm run trace -- tx <id>` (also `notes <id>`, `account <id>`, `internal-notes <from> <to>`, `wl-trace <id>`) | the rows; the lookup page is http://127.0.0.1:9700 |
 | see the shipper's log | `npm run logs` (or `npm run logs -- opensearch`) | — |
-| keep more / less history (default: 3 months) | `echo "RETENTION_MONTHS=6" >> .env && npm run up` (`0` = keep everything) | each month of traces is a few hundred MB at most |
+| keep more / less history (default: last 5 days) | `echo "RETENTION_DAYS=10" >> .env && npm run up` (`0` = keep everything) | older days are removed by themselves |
+| free disk space now / "clear everything" | `npm run clear -- --yes`, only after they confirm, because it deletes all trace data. It is the same as the **Clear all trace data** button on http://127.0.0.1:9700. | how much was freed; new logs keep coming in |
 | turn the background check off / on | `npm run autostart:off` / `npm run autostart` | — |
-| remove it completely | `npm run unwire`, `npm run autostart:off`, `npm run down`. Then **ask first** before `docker compose down -v` (deletes all trace history) and before deleting the folder | — |
+| remove it completely | **Ask first**, then `npm run remove -- --yes`. It unwires MNG and removes the containers, data, images (about 2.3 GB) and the background check. The repo folder stays; delete it only if they say so. | it is gone; `npm run setup` brings it back |
 
 ## Fix problems
 
@@ -103,6 +104,7 @@ Run these from `~/payment_system/local-opensearch`.
 
 ## How it works (only if asked)
 
-- **The shipper:** it tails `nps-logs` read-only, in one atomic `EVAL_RO` step per poll. The list grows at both ends (portals add at the end, n8n at the front). Each entry goes, unchanged plus `@timestamp`, into monthly `nps-app-YYYY.MM` indices, with the same field types as remote (strings are `keyword`).
+- **Retention:** it keeps the last 5 days (`RETENTION_DAYS`) in daily indices `nps-app-YYYY.MM.DD`, and drops older days by itself.
+- **The shipper:** it tails `nps-logs` read-only, in one atomic `EVAL_RO` step per poll. The list grows at both ends (portals add at the end, n8n at the front). Each entry goes, unchanged plus `@timestamp`, into daily `nps-app-YYYY.MM.DD` indices, with the same field types as remote (strings are `keyword`).
 - **OpenSearch** is built locally from the official no-Java OpenSearch 2.19.6 plus the laptop's own Java, because the office gateway blocks the Java runtime inside the official image.
 - **Details:** README.md, SETUP.md and QUICK-SETUP.md in `$LOS`.

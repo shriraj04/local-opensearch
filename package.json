@@ -11,6 +11,8 @@
     "autostart": "node scripts/cli.mjs autostart",
     "autostart:off": "node scripts/cli.mjs autostart:off",
     "ensure": "node scripts/cli.mjs ensure",
+    "clear": "node scripts/cli.mjs clear",
+    "remove": "node scripts/cli.mjs remove",
     "status": "node scripts/cli.mjs status",
     "doctor": "node scripts/cli.mjs doctor",
     "wire": "node scripts/cli.mjs wire",

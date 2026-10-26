@@ -87,7 +87,9 @@ The setup does everything for you:
 | | |
 |---|---|
 | 🔁 **Starts by itself** | Restarts, weeks switched off, Redis restarts: it picks up where it stopped. A small check at login and every 10 minutes repairs anything Docker cannot. |
-| 🪶 **Light** | About 1 GB of memory and almost no CPU when idle. |
+| 🪶 **Light** | About 1 GB of memory and almost no CPU when idle. On disk it keeps only the **last 5 days** of traces (a few MB) and removes older days by itself. |
+| 🧹 **Free space now** | The **Clear all trace data** button on http://127.0.0.1:9700, or `npm run clear` |
+| 🗑️ **Remove it completely** | `npm run remove` (asks first; frees about 2.3 GB, including the Docker images) |
 | ⬆️ **Update** | `git pull --ff-only && npm run setup` |
 | 🩺 **Check it** | `npm run doctor`. It should end with **All good**. |
 | ↩️ **Undo the MNG change** | `npm run unwire` |

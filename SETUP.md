@@ -68,6 +68,8 @@ That's it. It starts by itself when your laptop starts, even after weeks off, an
 | Get the latest version | `git pull && npm run up` |
 | Stop it | `npm run down` (it stays stopped until `npm run up`) |
 | Turn the background check off / on | `npm run autostart:off` / `npm run autostart` |
+| Free disk space now | **Clear all trace data** on http://127.0.0.1:9700, or `npm run clear` (days older than 5 are removed by themselves anyway) |
+| Remove it completely | `npm run remove` (asks first; frees about 2.3 GB) |
 | Undo the MNG change | `npm run unwire` (puts the original config files back exactly) |
 
 ## If something goes wrong

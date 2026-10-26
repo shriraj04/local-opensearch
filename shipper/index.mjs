@@ -28,9 +28,9 @@ export const config = {
   // the whole list. Kept in OpenSearch itself: if the data is wiped, the position goes with it.
   stateIndex: env.STATE_INDEX || 'astra-shipper-state',
   saveEveryMs: Number(env.SAVE_EVERY_MS || 2000),
-  // Keep this many months of traces (the current month included); older monthly indices are dropped.
-  // n8n's crons alone write ~6,000 lines an hour, so without a limit the data grows a few GB a year. 0 = keep all.
-  retentionMonths: Number(env.RETENTION_MONTHS ?? 3),
+  // Keep this many days of traces (today included); older daily indices are dropped by themselves.
+  // n8n's crons alone write ~6,000 lines an hour, so without a limit the data keeps growing. 0 = keep all.
+  retentionDays: Number(env.RETENTION_DAYS ?? 5),
   templateName: 'nps-app',
   batchSize: Number(env.BATCH_SIZE || 500),
   maxBatchBytes: Number(env.MAX_BATCH_BYTES || 8 * 1024 * 1024),
@@ -50,9 +50,11 @@ const sha1 = (text) => crypto.createHash('sha1').update(text).digest();
 
 // ---------- turning one Redis entry into one OpenSearch document ----------
 
-export function monthIndex(prefix, ms) {
+/** One index per day (remote uses one per month; MNG searches all of them, Dashboards uses nps-app-*). */
+export function dayIndex(prefix, ms) {
   const d = new Date(ms);
-  return `${prefix}${d.getUTCFullYear()}.${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  const two = (n) => String(n).padStart(2, '0');
+  return `${prefix}${d.getUTCFullYear()}.${two(d.getUTCMonth() + 1)}.${two(d.getUTCDate())}`;
 }
 
 /** Fixed, remote-looking (20 chars, base64url) id: the same entry always gets the same id. */
@@ -119,7 +121,7 @@ export function toDocument(raw, nowMs, cfg = config) {
   }
   const tsMs = Date.parse(entry.ts);
   const hasTs = Number.isFinite(tsMs);
-  const index = monthIndex(cfg.indexPrefix, hasTs ? tsMs : nowMs);
+  const index = dayIndex(cfg.indexPrefix, hasTs ? tsMs : nowMs);
   // A line break in valid JSON can only be whitespace between tokens (inside a string it must be
   // escaped), so folding it keeps the entry identical while keeping the bulk body one line per doc.
   const oneLine = raw.trim().replace(/[\r\n\u2028\u2029]+/g, ' ');
@@ -133,15 +135,23 @@ export function toDocument(raw, nowMs, cfg = config) {
   return { ok: true, index, body, tsMs: hasTs ? tsMs : null };
 }
 
-/** Start of the oldest month kept (UTC), or null to keep everything. */
-export function retentionCutoff(months = config.retentionMonths, nowMs = Date.now()) {
-  if (!months || months < 1) return null;
+/** Start (UTC) of the oldest day kept, or null to keep everything. */
+export function retentionCutoff(days = config.retentionDays, nowMs = Date.now()) {
+  if (!days || days < 1) return null;
   const d = new Date(nowMs);
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - (months - 1), 1);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - (days - 1));
+}
+
+/** Entries older than this are not kept: the retention, or the moment everything was cleared if later. */
+export function effectiveCutoff(nowMs = Date.now()) {
+  const r = retentionCutoff(config.retentionDays, nowMs);
+  const c = state.clearedAt || null;
+  if (r === null && c === null) return null;
+  return Math.max(r ?? -Infinity, c ?? -Infinity);
 }
 
 /** True for an entry older than what is kept (entries without a valid ts are always kept). */
-export function tooOld(raw, cutoff = retentionCutoff()) {
+export function tooOld(raw, cutoff = effectiveCutoff()) {
   if (cutoff === null) return false;
   try {
     const ms = Date.parse(JSON.parse(raw).ts);
@@ -244,6 +254,7 @@ export const state = {
   rejected: 0,
   resyncs: 0,
   skippedOld: 0,
+  clearedAt: null, // ms; set by "Clear all trace data"
   lastShippedAt: null,
   lastEntryTs: null,
   redisOk: false,
@@ -273,8 +284,8 @@ async function loadSavedPosition() {
 }
 
 async function savePosition(force = false) {
-  const key = `${state.a}:${state.b}:${state.lastLen}`;
-  if (!state.hashA || key === lastSaved.key) return;
+  const key = `${state.a}:${state.b}:${state.lastLen}:${state.clearedAt}`;
+  if (key === lastSaved.key) return;
   if (!force && Date.now() - lastSaved.at < config.saveEveryMs) return;
   try {
     const res = await os(
@@ -288,6 +299,7 @@ async function savePosition(force = false) {
         hashB: state.hashB,
         lastLen: state.lastLen,
         ring: copies.ring,
+        cleared_at: state.clearedAt ? new Date(state.clearedAt).toISOString() : null,
         saved_at: new Date().toISOString(),
       }),
     );
@@ -300,6 +312,8 @@ async function savePosition(force = false) {
 /** Takes up the saved window; the next pass proves it is still valid (or reads the list again). */
 async function resume() {
   const saved = await loadSavedPosition();
+  state.clearedAt = saved && saved.cleared_at ? Date.parse(saved.cleared_at) : null;
+  if (state.clearedAt) log(`keeping only entries since ${saved.cleared_at} (all trace data was cleared then)`);
   if (!saved || saved.version !== 2 || !(saved.b > saved.a)) {
     log('no saved position: reading the list from the start');
     return;
@@ -312,7 +326,7 @@ async function resume() {
     lastLen: saved.lastLen,
   });
   copies.load(saved.ring || []);
-  lastSaved = { at: Date.now(), key: `${saved.a}:${saved.b}:${saved.lastLen}` };
+  lastSaved = { at: Date.now(), key: `${saved.a}:${saved.b}:${saved.lastLen}:${state.clearedAt}` };
   log(`continuing from the saved position (${saved.b - saved.a} entries shipped, saved ${saved.saved_at})`);
 }
 
@@ -320,7 +334,7 @@ async function resume() {
 
 async function shipBatch(entries, listIndexOf) {
   const now = Date.now();
-  const cutoff = retentionCutoff(config.retentionMonths, now);
+  const cutoff = effectiveCutoff(now);
   const lines = [];
   const meta = [];
   const rejects = [];
@@ -549,24 +563,63 @@ async function pass(redis) {
   return true;
 }
 
+const DAY_MS = 86_400_000;
 let lastRetentionAt = 0;
-/** Drops monthly indices (and their -fallback) older than the retention; at start and every 6 hours. */
+/** Drops daily indices (and their -fallback) older than the retention; at start and every hour. */
 async function enforceRetention(force = false) {
   const cutoff = retentionCutoff();
-  if (cutoff === null || (!force && Date.now() - lastRetentionAt < 6 * 3600_000)) return;
+  if (cutoff === null || (!force && Date.now() - lastRetentionAt < 3600_000)) return;
   lastRetentionAt = Date.now();
   try {
     const res = await os('GET', `/_cat/indices/${config.indexPrefix}*?format=json&h=index`);
     for (const { index } of Array.isArray(res.json) ? res.json : []) {
-      const m = index.slice(config.indexPrefix.length).match(/^(\d{4})\.(\d{2})(-fallback)?$/);
-      if (m && Date.UTC(Number(m[1]), Number(m[2]) - 1, 1) < cutoff) {
+      const m = index.slice(config.indexPrefix.length).match(/^(\d{4})\.(\d{2})\.(\d{2})(-fallback)?$/);
+      if (m && Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) + DAY_MS <= cutoff) {
         const del = await os('DELETE', `/${index}`);
-        log(`retention (${config.retentionMonths} months): removed ${index} (${del.status})`);
+        log(`older than ${config.retentionDays} days: removed ${index} (${del.status})`);
       }
     }
   } catch (err) {
     noteError(`retention clean-up: ${err.message}`);
   }
+}
+
+/** Earlier versions wrote one index per month: remove those and read the list again into daily indices. */
+async function migrateFromMonthly() {
+  const res = await os('GET', `/_cat/indices/${config.indexPrefix}*?format=json&h=index`);
+  const monthly = (Array.isArray(res.json) ? res.json : []).map((r) => r.index).filter((ix) => /^\d{4}\.\d{2}(-fallback)?$/.test(ix.slice(config.indexPrefix.length)));
+  if (!monthly.length) return;
+  for (const ix of monthly) await os('DELETE', `/${ix}`);
+  await os('DELETE', stateDocPath());
+  log(`switched to one index per day: removed ${monthly.join(', ')}; the list is read again (last ${config.retentionDays || 'all'} days kept)`);
+}
+
+async function dataBytes() {
+  const res = await os('GET', `/_cat/indices/${config.indexPrefix}*,${config.rejectIndex}?format=json&bytes=b&h=index,store.size`);
+  return (Array.isArray(res.json) ? res.json : []).reduce((n, r) => n + Number(r['store.size'] || 0), 0);
+}
+
+// "Clear all trace data": runs between passes (never in the middle of a batch).
+let clearRequest = null;
+function requestClear() {
+  if (!clearRequest) {
+    const r = {};
+    r.done = new Promise((resolve, reject) => Object.assign(r, { resolve, reject }));
+    clearRequest = r;
+  }
+  return clearRequest.done;
+}
+
+async function doClear() {
+  const freed = await dataBytes();
+  state.clearedAt = Date.now();
+  const res = await os('GET', `/_cat/indices/${config.indexPrefix}*,${config.rejectIndex}?format=json&h=index`);
+  for (const { index } of Array.isArray(res.json) ? res.json : []) await os('DELETE', `/${index}`);
+  await ensureIndexSetup();
+  await savePosition(true);
+  state.skippedOld = 0;
+  log(`cleared all trace data (${(freed / 1048576).toFixed(1)} MB); keeping only new entries from now on`);
+  return { cleared_at: new Date(state.clearedAt).toISOString(), freed_bytes: freed };
 }
 
 async function waitForOpenSearch() {
@@ -608,8 +661,12 @@ export async function run() {
   });
 
   startStatusServer();
-  log(`shipping redis://${config.redisHost}:${config.redisPort}/${config.redisDb} list "${config.listKey}" → ${config.opensearchUrl} ${config.indexPrefix}YYYY.MM`);
+  log(`shipping redis://${config.redisHost}:${config.redisPort}/${config.redisDb} list "${config.listKey}" → ${config.opensearchUrl} ${config.indexPrefix}YYYY.MM.DD`);
   await waitForOpenSearch();
+  await migrateFromMonthly().catch((err) => noteError(`switching to daily indices: ${err.message}`));
+  // newest entry already stored (for the status page after a restart)
+  const newest = await os('POST', `/${config.indexPrefix}*/_search`, JSON.stringify({ size: 0, aggs: { t: { max: { field: 'ts' } } } })).catch(() => null);
+  state.lastEntryTs = newest?.json?.aggregations?.t?.value_as_string || null;
   await enforceRetention(true);
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -631,6 +688,11 @@ export async function run() {
 
   while (!stopping) {
     try {
+      if (clearRequest) {
+        const r = clearRequest;
+        clearRequest = null;
+        await doClear().then(r.resolve, r.reject);
+      }
       const more = await pass(redis);
       if (!more) await enforceRetention();
       state.passes += 1;
@@ -671,7 +733,9 @@ export function statusSnapshot() {
     in_fallback: state.fallback,
     rejected: state.rejected,
     resyncs: state.resyncs,
-    retention_months: config.retentionMonths,
+    retention_days: config.retentionDays,
+    kept_from: effectiveCutoff() === null ? null : new Date(effectiveCutoff()).toISOString(),
+    cleared_at: state.clearedAt ? new Date(state.clearedAt).toISOString() : null,
     skipped_older_than_retention: state.skippedOld,
     dashboards_url: env.DASHBOARDS_PUBLIC_URL || 'http://127.0.0.1:5601',
     last_shipped_at: state.lastShippedAt,
@@ -727,7 +791,7 @@ async function parity() {
       res = await os('POST', '/_search/scroll', JSON.stringify({ scroll: '1m', scroll_id: res.json._scroll_id }));
     }
     if (res.json && res.json._scroll_id) await os('DELETE', '/_search/scroll', JSON.stringify({ scroll_id: res.json._scroll_id }));
-    return { redis_entries: length, missing_in_opensearch: missing, not_in_redis: extra, sample_not_in_redis: sample };
+    return { redis_entries: length, kept_entries: expected.size, missing_in_opensearch: missing, not_in_redis: extra, sample_not_in_redis: sample };
   } finally {
     redis.disconnect();
   }
@@ -759,6 +823,15 @@ function startStatusServer() {
         }
         if (url.pathname === '/api/indices') {
           sendJson(res, 200, await indexStats());
+          return;
+        }
+        if (url.pathname === '/api/clear' && req.method === 'POST') {
+          const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timed out; is OpenSearch up?')), 60_000));
+          sendJson(res, 200, await Promise.race([requestClear(), timeout]));
+          return;
+        }
+        if (url.pathname === '/api/size') {
+          sendJson(res, 200, { data_bytes: await dataBytes(), retention_days: config.retentionDays, kept_from: statusSnapshot().kept_from });
           return;
         }
         if (url.pathname === '/api/parity') {
@@ -801,4 +874,4 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 }
 
 // for tests
-export { pass as _pass, resync as _resync, copies as _copies, parity as _parity };
+export { pass as _pass, resync as _resync, copies as _copies, parity as _parity, doClear as _clear, enforceRetention as _enforceRetention, migrateFromMonthly as _migrateFromMonthly };

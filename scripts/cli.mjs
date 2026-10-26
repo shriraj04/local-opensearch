@@ -9,6 +9,8 @@
 //   npm run logs [-- shipper|opensearch|dashboards] [-- -f]
 //   npm run down               stop the containers (data is kept); stays stopped until npm run up
 //   npm run autostart[:off]    background check at login + every 10 min that repairs it (setup turns it on)
+//   npm run clear              delete all trace data now (keeps only new logs); old days also go by themselves after 5 days
+//   npm run remove             remove everything it put on the laptop (data, containers, images, background check)
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -407,6 +409,11 @@ async function status({ short = false, hideWiring = false } = {}) {
     (j.redis.connected ? ok : bad)(`Redis ${j.redis.list}: ${fmt(j.redis.length)} entries`);
     (j.opensearch.reachable ? ok : bad)(`OpenSearch nps-app-*: ${fmt(docs)} documents`);
     (j.lag === 0 ? ok : warn)(j.lag === 0 ? 'Shipper: live, nothing waiting' : `Shipper: ${fmt(j.lag)} entries waiting`);
+    const size = (await tryJson(`${SHIP}/api/size`))?.json;
+    if (size) {
+      const keep = j.retention_days ? `last ${j.retention_days} days` : 'everything';
+      info(`Trace data: ${(size.data_bytes / 1048576).toFixed(1)} MB · keeps ${keep}${j.cleared_at ? ` (cleared ${j.cleared_at.slice(0, 16).replace('T', ' ')} UTC)` : ''} · free it now: npm run clear`);
+    }
     (j.rejected ? warn : ok)(`Rejected by OpenSearch: ${fmt(j.rejected)}${j.rejected ? ' (kept in astra-shipper-rejected)' : ''}`);
     if (j.last_error && (!j.redis.connected || !j.opensearch.reachable)) info(`last error: ${j.last_error}`);
   } else bad(`Shipper status page not reachable at ${SHIP}`);
@@ -548,6 +555,7 @@ async function doctor() {
         continue;
       }
       if (!e || typeof e !== 'object' || !e.ts) continue;
+      if (s?.kept_from && Date.parse(e.ts) < Date.parse(s.kept_from)) continue; // older than what is kept, on purpose
       checked += 1;
       const filter = [{ term: { ts: e.ts } }];
       if (e.e_id !== undefined && e.e_id !== '') filter.push({ term: { e_id: String(e.e_id) } });
@@ -566,7 +574,9 @@ async function doctor() {
   }
   check(
     par && par.missing_in_opensearch === 0,
-    `exact check: all ${fmt(par?.redis_entries)} Redis entries are in OpenSearch, each once`,
+    par && par.kept_entries !== par.redis_entries
+      ? `exact check: all ${fmt(par.kept_entries)} entries kept (the newer part of the ${fmt(par.redis_entries)} in Redis) are in OpenSearch, each once`
+      : `exact check: all ${fmt(par?.redis_entries)} Redis entries are in OpenSearch, each once`,
     par ? `${fmt(par.missing_in_opensearch)} Redis entries are not in OpenSearch` : 'exact check could not run (shipper not reachable)',
   );
   if (par?.not_in_redis) warn(`${fmt(par.not_in_redis)} documents are no longer in the Redis list (kept history after Redis was trimmed or flushed, or a duplicate): ${SHIP}/api/parity`);
@@ -754,6 +764,45 @@ async function ask(question) {
   return answer;
 }
 
+// ---------- freeing disk space ----------
+
+/** Deletes all trace data now; from then on only new log lines are kept (nothing old flows back from Redis). */
+async function clear() {
+  const s = (await tryJson(`${SHIP}/status`))?.json;
+  if (!s) fail(`the shipper is not reachable at ${SHIP} — run: npm run up`);
+  if (!args.includes('--yes') && !args.includes('-y')) {
+    const answer = await ask('Delete ALL local trace data now (Dashboards and MNG trace screens start empty, new logs keep coming)? [y/N] ');
+    if (answer === null) fail('add --yes to confirm (npm run clear -- --yes)');
+    if (!answer.startsWith('y')) return console.log('Nothing deleted.');
+  }
+  const r = await tryJson(`${SHIP}/api/clear`, { method: 'POST', timeout: 90_000 });
+  if (!r || r.status !== 200) fail(`clear failed: ${r?.json?.error || 'shipper not reachable'}`);
+  ok(`Cleared ${(r.json.freed_bytes / 1048576).toFixed(1)} MB of trace data. Only log lines from now on are kept.`);
+}
+
+/** Removes everything this tool put on the laptop (data, containers, images, background check). */
+async function remove() {
+  console.log(`This removes Local OpenSearch from this laptop:
+  - puts the original MNG / WL-MNG config back (npm run unwire)
+  - turns the background check off
+  - deletes the containers, ALL trace data and the Docker images (about 2.3 GB)
+  - deletes the local OpenSearch build (opensearch/build)
+The repo folder itself stays; delete it yourself if you want.`);
+  if (!args.includes('--yes') && !args.includes('-y')) {
+    const answer = await ask('\nRemove it? [y/N] ');
+    if (answer === null) fail('add --yes to confirm (npm run remove -- --yes)');
+    if (!answer.startsWith('y')) return console.log('Nothing removed.');
+  }
+  if (APPS.some(({ app }) => wiringState(app).wired)) await unwire();
+  autostart(false);
+  fs.mkdirSync(RUN_DIR, { recursive: true });
+  fs.writeFileSync(STOPPED_MARK, `${new Date().toISOString()}\n`);
+  const r = compose(['down', '-v', '--rmi', 'all', '--remove-orphans'], { stdio: 'inherit' });
+  if (r.status !== 0) warn('docker compose down reported a problem (see above)');
+  fs.rmSync(path.join(ROOT, 'opensearch', 'build'), { recursive: true, force: true });
+  ok('Removed. To set it up again later: npm run setup');
+}
+
 async function setup() {
   const yes = args.includes('--yes') || args.includes('-y');
   console.log('\nLocal OpenSearch setup\n======================\n');
@@ -810,6 +859,8 @@ const commands = {
   ensure,
   autostart: () => autostart(true),
   'autostart:off': () => autostart(false),
+  clear,
+  remove,
   down,
   status: () => status(),
   doctor,

@@ -45,6 +45,8 @@
   .where { color: var(--muted); font-size: 13px; }
   .meta { margin: 14px 0 8px; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
   .meta code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+  button.danger { font: inherit; border: 1px solid var(--bad); color: var(--bad); background: transparent; border-radius: 8px; padding: 6px 12px; cursor: pointer; margin-top: 8px; }
+  button.danger:hover { background: var(--bad-bg); }
   .err { color: var(--bad); background: var(--bad-bg); padding: 8px 12px; border-radius: 8px; margin-top: 12px; }
   .scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -79,6 +81,8 @@
     <div class="card"><div class="k">Waiting to be shipped</div><div class="v" id="c-lag">–</div><div class="h" id="c-lag-h"></div></div>
     <div class="card"><div class="k">Rejected by OpenSearch</div><div class="v" id="c-rej">–</div><div class="h" id="c-rej-h"></div></div>
     <div class="card"><div class="k">Newest entry</div><div class="v" id="c-last">–</div><div class="h" id="c-last-h"></div></div>
+    <div class="card"><div class="k">Trace data on disk</div><div class="v" id="c-size">–</div><div class="h" id="c-size-h"></div>
+      <button class="danger" id="btn-clear" type="button" title="Deletes all trace data now. New logs keep coming in.">Clear all trace data</button></div>
   </div>
 
   <section>
@@ -95,7 +99,7 @@
   <section>
     <h2>Indices</h2>
     <div class="scroll"><table><thead><tr><th>Index</th><th>Health</th><th>Documents</th><th>Size</th></tr></thead><tbody id="indices"><tr><td colspan="4" class="empty">Loading…</td></tr></tbody></table></div>
-    <div class="hint">Monthly indices, named like remote (<code>nps-app-YYYY.MM</code>). Entries OpenSearch refused are kept in <code>astra-shipper-rejected</code> with the reason.</div>
+    <div class="hint">One index per day (<code>nps-app-YYYY.MM.DD</code>; remote uses one per month, which makes no difference to MNG or Dashboards). Days older than the kept period are removed by themselves. Entries OpenSearch refused are kept in <code>astra-shipper-rejected</code> with the reason.</div>
   </section>
 </main>
 
@@ -156,6 +160,11 @@ async function refresh() {
     $('c-lag-h').textContent = s.lag === 0 ? 'all shipped — live' : 'catching up…';
     $('c-rej').textContent = fmt(s.rejected);
     $('c-last').textContent = s.last_entry_ts ? ago(s.last_entry_ts) : '–';
+    try {
+      const z = await (await fetch('/api/size')).json();
+      $('c-size').textContent = bytes(z.data_bytes);
+      $('c-size-h').textContent = z.retention_days ? `keeps the last ${z.retention_days} days` : 'keeps everything';
+    } catch { /* shown by the pill */ }
     $('c-last-h').textContent = s.last_entry_ts ? new Date(s.last_entry_ts).toLocaleString() : '';
     const pill = $('pill');
     if (!s.redis.connected || !s.opensearch.reachable) { pill.className = 'pill bad'; pill.textContent = !s.redis.connected ? 'Redis not reachable' : 'OpenSearch not reachable'; }
@@ -248,6 +257,21 @@ function drawResult(r) {
     tr.after(json);
   });
 }
+
+$('btn-clear').addEventListener('click', async () => {
+  if (!confirm('Delete ALL local trace data now?\n\nDashboards and the MNG trace screens start empty; new logs keep coming in. Older days are also removed by themselves.')) return;
+  const b = $('btn-clear');
+  b.disabled = true; b.textContent = 'Clearing…';
+  try {
+    const r = await (await fetch('/api/clear', { method: 'POST' })).json();
+    if (r.error) throw new Error(r.error);
+    b.textContent = `Cleared ${bytes(r.freed_bytes)}`;
+  } catch (err) {
+    b.textContent = `Failed: ${err.message}`;
+  }
+  setTimeout(() => { b.disabled = false; b.textContent = 'Clear all trace data'; }, 4000);
+  refresh();
+});
 
 drawTabs();
 refresh();

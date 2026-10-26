@@ -20,10 +20,11 @@ after(() => container && docker('rm', '-f', container));
 
 process.env.BATCH_SIZE = '4'; // small steps, so pushes land in the middle of a read
 process.env.SAVE_EVERY_MS = '0';
+process.env.RETENTION_DAYS = '5';
 process.env.REDIS_HOST = '127.0.0.1';
 process.env.REDIS_PORT = String(port || 6379);
 const shipper = await import('../shipper/index.mjs');
-const { _pass: pass, _resync: resync, _copies: copies, _parity: parity, state, docId, CopyCounter } = shipper;
+const { _pass: pass, _resync: resync, _copies: copies, _parity: parity, _clear: clear, _enforceRetention: enforceRetention, state, docId, CopyCounter } = shipper;
 const { default: Redis } = await import('../shipper/node_modules/ioredis/built/index.js');
 const redis = container ? new Redis({ host: '127.0.0.1', port: Number(port) }) : null;
 after(() => redis && redis.disconnect());
@@ -55,6 +56,11 @@ globalThis.fetch = async (url, init = {}) => {
     body = { items };
   } else if (u.pathname.endsWith('/_search') && u.search.includes('scroll')) {
     body = { _scroll_id: 's', hits: { hits: [...store.keys()].map((id) => ({ _id: id, _index: store.get(id), _source: {} })) } };
+  } else if (u.pathname.startsWith('/_cat/indices')) {
+    body = [...new Set(store.values())].map((index) => ({ index, 'store.size': '1000' }));
+  } else if ((init.method || 'GET') === 'DELETE' && /^\/nps-app-|^\/astra-shipper-rejected$/.test(u.pathname)) {
+    const index = decodeURIComponent(u.pathname.slice(1));
+    for (const [id, ix] of [...store]) if (ix === index) store.delete(id);
   } else if (u.pathname === '/_search/scroll') {
     body = (init.method || 'GET') === 'DELETE' ? {} : { _scroll_id: 's', hits: { hits: [] } };
   } else if ((init.method || 'GET') === 'GET' && u.pathname.includes('astra-shipper-state')) {
@@ -63,7 +69,7 @@ globalThis.fetch = async (url, init = {}) => {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 };
 
-const entry = (n, src) => JSON.stringify({ ts: '2026-10-23T10:00:00.000Z', e_event: `E${n}`, src });
+const entry = (n, src, ts = new Date().toISOString()) => JSON.stringify({ ts, e_event: `E${n}`, src });
 const list = () => redis.lrange(KEY, 0, -1);
 const expectedIds = async () => {
   const c = new CopyCounter(2000);
@@ -82,6 +88,7 @@ async function reset(items) {
   conflicts = 0;
   resync('test');
   state.resyncs = 0;
+  state.clearedAt = null;
   copies.clear();
   await redis.del(KEY);
   if (items.length) await redis.rpush(KEY, ...items);
@@ -157,6 +164,38 @@ test('entries older than the retention are not shipped, and the exact check agre
   await drain();
   assert.equal(store.size, 2);
   assert.ok(state.skippedOld >= 1);
+  const p = await parity();
+  assert.equal(p.missing_in_opensearch, 0);
+  assert.equal(p.not_in_redis, 0);
+});
+
+test('older days are removed by themselves (daily indices)', { skip }, async () => {
+  const day = (d) => new Date(Date.now() - d * 86_400_000).toISOString();
+  await reset([entry(1, 'today'), entry(2, '3 days ago', day(3)), entry(3, '8 days ago', day(8))]);
+  // the 8-day-old entry is never shipped; force an older index to exist, then let the clean-up remove it
+  await drain();
+  assert.equal(store.size, 2);
+  store.set('stale-doc', `nps-app-${new Date(Date.now() - 9 * 86_400_000).toISOString().slice(0, 10).replace(/-/g, '.')}`);
+  await enforceRetention(true);
+  assert.equal(store.has('stale-doc'), false);
+  assert.equal(store.size, 2);
+});
+
+test('"Clear all trace data" empties it and keeps only what comes after', { skip }, async () => {
+  await reset([entry(1, 'before'), entry(2, 'before')]);
+  await drain();
+  assert.equal(store.size, 2);
+  const r = await clear();
+  assert.equal(store.size, 0);
+  assert.ok(r.cleared_at);
+  await new Promise((res) => setTimeout(res, 5));
+  await redis.rpush(KEY, entry(3, 'after'));
+  await redis.lpush(KEY, entry(4, 'after-n8n'));
+  await drain();
+  assert.equal(store.size, 2, 'only the two new entries');
+  resync('re-read after clear'); // even a full re-read does not bring the old ones back
+  await drain();
+  assert.equal(store.size, 2);
   const p = await parity();
   assert.equal(p.missing_in_opensearch, 0);
   assert.equal(p.not_in_redis, 0);

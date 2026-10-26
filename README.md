@@ -15,7 +15,7 @@ It also gives you **OpenSearch Dashboards**, the same Discover screen you use on
 Nothing is mocked. Every portal and n8n already write their log entries into the local Redis list `nps-logs`. On Alpha/Omega a shipper copies that list into OpenSearch (`nps-app-*`). Locally nothing did that, and MNG pointed at an OpenSearch it cannot reach, so those screens failed. This project adds the missing pieces:
 
 ```
-portals + n8n ──RPUSH──▶ Redis nps-logs ──(read only)──▶ log shipper ──▶ OpenSearch nps-app-YYYY.MM ──▶ MNG / WL-MNG screens
+portals + n8n ──RPUSH──▶ Redis nps-logs ──(read only)──▶ log shipper ──▶ OpenSearch nps-app-YYYY.MM.DD ──▶ MNG / WL-MNG screens
                               │                                                │
                               └──▶ Redis Log Viewer (unchanged)                └──▶ OpenSearch Dashboards
 ```
@@ -50,7 +50,10 @@ The heaviest moment is reading the whole Redis list again, after a restart for e
 
 ### How much disk it uses
 
-Each log line takes about 250 bytes. n8n's scheduled jobs alone write about 6,000 lines an hour (the processor-status cron writes about 1,000 lines every 10 minutes), so expect roughly 10–15 MB per working day. To keep this bounded, the shipper keeps the **last 3 months** (the current month plus the two before it) and drops older monthly indices by itself. Change it with `RETENTION_MONTHS` in `.env` (`0` = keep everything), then `npm run up`.
+Each log line takes about 250 bytes. n8n's scheduled jobs alone write about 6,000 lines an hour (the processor-status cron writes about 1,000 lines every 10 minutes). So the shipper keeps only the **last 5 days** (today plus the 4 days before) and removes older days by itself, which is usually a few MB in total. Change it with `RETENTION_DAYS` in `.env` (`0` = keep everything), then run `npm run up`.
+
+- **Free space right now:** the **Clear all trace data** button on http://127.0.0.1:9700, or `npm run clear`. It deletes all trace data at once; new log lines keep coming in, and nothing old comes back from Redis.
+- **Remove everything** (data, containers, background check and the Docker images, about 2.3 GB, the biggest part): `npm run remove`. It asks first, and also puts MNG's original config back.
 
 These lines appear even when nobody is logged in: n8n's crons run all the time, and every MNG page request (even the login page) is logged with `uid 0`.
 
@@ -78,6 +81,8 @@ It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN,
 | `npm run down` | Stops the containers. The data is kept, and it stays stopped (also after a reboot) until `npm run up`. |
 | `npm run autostart` / `autostart:off` | Turns the background check on or off: at login and every 10 minutes it repairs a removed container or a lost network. Its log: `journalctl --user -u local-opensearch-guard`. |
 | `npm run ensure` | Runs that check once, now. |
+| `npm run clear` | Deletes all trace data now, to free disk space (the same as the **Clear all trace data** button on the status page). New log lines keep coming in. Older days are also removed by themselves after 5 days. |
+| `npm run remove` | Removes everything it put on the laptop: puts MNG's config back, deletes the containers, data, Docker images (about 2.3 GB) and the background check. It asks first. |
 | `npm test` | Unit tests. |
 
 ## Pages
@@ -94,7 +99,7 @@ All three listen on 127.0.0.1 only.
 
 **The same:**
 - **Documents:** each document is the Redis entry exactly as the app wrote it, plus `@timestamp`, like on `mnops.cdmx.io`.
-- **Indices:** monthly, `nps-app-YYYY.MM`, like remote.
+- **Indices:** `nps-app-*`, like remote. Locally there is one per day (`nps-app-YYYY.MM.DD`) instead of one per month, so old days can be dropped cheaply; MNG searches all indices, so this makes no difference.
 - **Field types:** text fields are `keyword`, as on remote. That is why MNG's `terms` filter on `entry_type` works and why `domain` / `git_version` can be aggregated without `.keyword`. `ts` and `@timestamp` are dates.
 - **Queries:** MNG and WL-MNG run their own unchanged code (`opensearch-query.js`) against it. The status page and `npm run trace` also run that module, with the options from the action files of the branch that is checked out.
 - **Cross-tenant rows:** all local tenants (Alpha, Omega, white-labels) share one cluster, just as remote environments share one. So behaviour like an account's trace listing rows from another environment with the same id (PRE-03) shows up locally too.

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { toDocument, docId, CopyCounter, monthIndex, retentionCutoff, tooOld } from '../shipper/index.mjs';
+import { toDocument, docId, CopyCounter, dayIndex, retentionCutoff, tooOld } from '../shipper/index.mjs';
 import { makeParser, LOOKUPS } from '../shipper/mng-query.mjs';
 
 const cfg = { indexPrefix: 'nps-app-', liveWindowMs: 5000 };
@@ -13,7 +13,7 @@ test('backlog entry: same JSON plus @timestamp = ts, monthly index from ts', () 
   const raw = '{"ts":"2026-09-30T23:59:59.999Z","level":"INFO","p_key":"TRANSACTION","p_value":189444,"aux":{"a":1}}';
   const doc = toDocument(raw, NOW, cfg);
   assert.equal(doc.ok, true);
-  assert.equal(doc.index, 'nps-app-2026.09');
+  assert.equal(doc.index, 'nps-app-2026.09.30');
   const parsed = JSON.parse(doc.body);
   assert.equal(parsed['@timestamp'], '2026-09-30T23:59:59.999Z');
   const { '@timestamp': _, ...rest } = parsed;
@@ -24,7 +24,7 @@ test('live entry: @timestamp is the time it was shipped, like remote ingest time
   const raw = '{"ts":"2026-10-23T09:29:59.900Z","msg":"x"}';
   const doc = toDocument(raw, NOW, cfg);
   assert.equal(JSON.parse(doc.body)['@timestamp'], '2026-10-23T09:30:00.000Z');
-  assert.equal(doc.index, 'nps-app-2026.10');
+  assert.equal(doc.index, 'nps-app-2026.10.23');
 });
 
 test('values reach OpenSearch exactly as written (no re-serialising)', () => {
@@ -93,8 +93,8 @@ test('continuing from a saved position gives the same ids as reading the whole l
   assert.deepEqual([...head, ...tail], all);
 });
 
-test('monthIndex uses UTC', () => {
-  assert.equal(monthIndex('nps-app-', Date.parse('2026-10-31T23:30:00-02:00')), 'nps-app-2026.11');
+test('dayIndex uses UTC', () => {
+  assert.equal(dayIndex('nps-app-', Date.parse('2026-10-31T23:30:00-02:00')), 'nps-app-2026.11.01');
 });
 
 // ---------- the MNG option resolution, against the real action files ----------
@@ -135,15 +135,15 @@ test('Wappler expressions resolve like MNG', () => {
   assert.throws(() => parse('id {{x}}'));
 });
 
-test('retention keeps whole months: the current one plus the ones before it', () => {
+test('retention keeps whole days: today plus the days before it', () => {
   const now = Date.parse('2026-10-26T05:00:00Z');
-  assert.equal(new Date(retentionCutoff(3, now)).toISOString(), '2026-08-01T00:00:00.000Z');
-  assert.equal(new Date(retentionCutoff(1, now)).toISOString(), '2026-10-01T00:00:00.000Z');
-  assert.equal(new Date(retentionCutoff(14, now)).toISOString(), '2025-09-01T00:00:00.000Z');
+  assert.equal(new Date(retentionCutoff(5, now)).toISOString(), '2026-10-22T00:00:00.000Z');
+  assert.equal(new Date(retentionCutoff(1, now)).toISOString(), '2026-10-26T00:00:00.000Z');
+  assert.equal(new Date(retentionCutoff(30, Date.parse('2026-03-05T12:00:00Z'))).toISOString(), '2026-02-04T00:00:00.000Z');
   assert.equal(retentionCutoff(0, now), null);
-  const cutoff = retentionCutoff(3, now);
-  assert.equal(tooOld('{"ts":"2026-07-31T23:59:59.999Z"}', cutoff), true);
-  assert.equal(tooOld('{"ts":"2026-08-01T00:00:00.000Z"}', cutoff), false);
+  const cutoff = retentionCutoff(5, now);
+  assert.equal(tooOld('{"ts":"2026-10-21T23:59:59.999Z"}', cutoff), true);
+  assert.equal(tooOld('{"ts":"2026-10-22T00:00:00.000Z"}', cutoff), false);
   assert.equal(tooOld('{"msg":"no ts"}', cutoff), false);
   assert.equal(tooOld('not json', cutoff), false);
   assert.equal(tooOld('{"ts":"2020-01-01T00:00:00Z"}', null), false);
