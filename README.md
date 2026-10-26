@@ -24,7 +24,7 @@ The list grows at **both ends**: the portals add entries at the end, and n8n's R
 
 ## Start
 
-**New here? Follow the [Easy Setup Guide](QUICK-SETUP.md): 3 steps, about 10 minutes.** Full details are in [SETUP.md](SETUP.md).
+**New here? Follow the [Easy Setup Guide](QUICK-SETUP.md): 3 steps, about 10 minutes.** Using Claude Code? [Paste one prompt](QUICK-SETUP.md#easiest-let-claude-code-do-it) and it does the setup for you (skill: `.claude/skills/local-opensearch`). Full details are in [SETUP.md](SETUP.md).
 
 ```bash
 cd ~/payment_system && git clone git@github.com:shriraj04/local-opensearch.git

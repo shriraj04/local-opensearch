@@ -798,7 +798,7 @@ You're all set!
   Dashboards:      ${DASH}   (same screen as mnops.cdmx.io, for your local data)
   Quick lookup:    ${SHIP}
 
-It starts by itself whenever your laptop starts, even after weeks off. To update later:  git pull && npm run setup`);
+It starts by itself whenever your laptop starts, even after weeks off. To update later:  git pull --ff-only && npm run setup`);
 }
 
 // ---------- main ----------

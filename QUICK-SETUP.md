@@ -27,6 +27,23 @@ Tick these off. If one is missing, the setup will tell you what to do anyway.
 
 ---
 
+## Easiest: let Claude Code do it
+
+Open Claude Code in your `payment_system` folder and paste this prompt. It clones the repo, sets everything up, connects your MNG and tests it, all in one go:
+
+```text
+Set up Local OpenSearch on my laptop so traces and internal notes work on my local ASTRA, and connect my local MNG to it.
+1. If ~/payment_system/local-opensearch does not exist, clone it: cd ~/payment_system && git clone git@github.com:shriraj04/local-opensearch.git
+2. Read ~/payment_system/local-opensearch/.claude/skills/local-opensearch/SKILL.md and follow its "Set it up (one go)" section end to end, then report back as it says.
+Never commit or push anything in the payment_system repo.
+```
+
+Afterwards, short prompts are enough: **"check local opensearch"**, **"unwire opensearch"** (revert after testing), **"update local opensearch"**.
+
+Prefer doing it yourself? Follow the 3 steps below.
+
+---
+
 ## Setup in 3 steps
 
 ### Step 1. Download it into your `payment_system` folder
@@ -71,7 +88,7 @@ The setup does everything for you:
 |---|---|
 | 🔁 **Starts by itself** | Restarts, weeks switched off, Redis restarts: it picks up where it stopped. A small check at login and every 10 minutes repairs anything Docker cannot. |
 | 🪶 **Light** | About 1 GB of memory and almost no CPU when idle. |
-| ⬆️ **Update** | `git pull && npm run setup` |
+| ⬆️ **Update** | `git pull --ff-only && npm run setup` |
 | 🩺 **Check it** | `npm run doctor`. It should end with **All good**. |
 | ↩️ **Undo the MNG change** | `npm run unwire` |
 | ⏹️ **Stop it** | `npm run down`. To start it again: `npm run setup`. |
