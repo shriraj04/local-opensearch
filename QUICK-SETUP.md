@@ -69,7 +69,7 @@ The setup does everything for you:
 
 | | |
 |---|---|
-| 🔁 **Starts by itself** | It starts whenever your laptop starts. Nothing to do every day. |
+| 🔁 **Starts by itself** | Restarts, weeks switched off, Redis restarts: it picks up where it stopped. A small check at login and every 10 minutes repairs anything Docker cannot. |
 | 🪶 **Light** | About 1 GB of memory and almost no CPU when idle. |
 | ⬆️ **Update** | `git pull && npm run setup` |
 | 🩺 **Check it** | `npm run doctor`. It should end with **All good**. |

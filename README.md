@@ -20,6 +20,8 @@ portals + n8n ──RPUSH──▶ Redis nps-logs ──(read only)──▶ log
                               └──▶ Redis Log Viewer (unchanged)                └──▶ OpenSearch Dashboards
 ```
 
+The list grows at **both ends**: the portals add entries at the end, and n8n's Redis node adds them at the front. The shipper tracks what it has copied as a window that new entries join from either side. Each step happens in one atomic, read-only Redis call (`EVAL_RO`), so an idle check costs a few tiny reads and only new entries are ever read.
+
 ## Start
 
 **New here? Follow the [Easy Setup Guide](QUICK-SETUP.md): 3 steps, about 10 minutes.** Full details are in [SETUP.md](SETUP.md).
@@ -32,7 +34,7 @@ cd local-opensearch && npm run setup                # checks the laptop, starts 
 
 Needs Docker, Node 20+, Java 17 or 21 on this computer (found in `/usr/lib/jvm` or `JAVA_HOME`; not needed when the image is loaded ready-made, see SETUP.md), and the local ASTRA stack running (network `nps_default`, container `nps_redis`).
 
-It starts by itself after a reboot, like the ASTRA containers do. `npm run down` stops it until the next `npm run up`.
+It starts by itself after a reboot, like the ASTRA containers do, and continues from where it stopped; it does not re-read everything. A small background check (`npm run autostart`, which `npm run setup` turns on) runs at login and every 10 minutes and repairs anything Docker cannot, such as a removed container or a recreated `nps_default` network. `npm run down` stops it until the next `npm run up`, and the background check then leaves it alone.
 
 ### Resources (hard limits)
 
@@ -67,7 +69,9 @@ It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN,
 | `npm run unwire` | Puts the original files back byte for byte. If someone edited a file since, only `OPS_URL` is put back and their edits are kept. |
 | `npm run trace -- tx 189444` | Transaction Trace for a transaction, in the terminal. Also `notes 189444`, `account 140`, `internal-notes 2026-10-01 2026-10-23`, `wl-trace 189444`. |
 | `npm run logs` | The shipper's own output. Use `npm run logs -- opensearch` or `-- dashboards` for the others, and add `-- -f` to keep following. |
-| `npm run down` | Stops the containers. The data is kept. |
+| `npm run down` | Stops the containers. The data is kept, and it stays stopped (also after a reboot) until `npm run up`. |
+| `npm run autostart` / `autostart:off` | Turns the background check on or off: at login and every 10 minutes it repairs a removed container or a lost network. Its log: `journalctl --user -u local-opensearch-guard`. |
+| `npm run ensure` | Runs that check once, now. |
 | `npm test` | Unit tests. |
 
 ## Pages

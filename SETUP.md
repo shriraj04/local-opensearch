@@ -57,7 +57,7 @@ It takes about 10 minutes, once.
    - Dashboards: http://127.0.0.1:5601. It opens on Discover. Use **Open** to load the saved searches for each MNG screen.
    - Quick lookup page: http://127.0.0.1:9700
 
-That's it. It starts by itself when your laptop starts, like the ASTRA containers do.
+That's it. It starts by itself when your laptop starts, even after weeks off, and continues from where it stopped. A small background check repairs anything Docker cannot.
 
 ## Everyday commands
 
@@ -66,7 +66,8 @@ That's it. It starts by itself when your laptop starts, like the ASTRA container
 | See if it is working | `npm run status` |
 | Look up a trace in the terminal | `npm run trace -- tx 189445` (also `notes <tx>`, `account <id>`, `internal-notes 2026-10-01 2026-10-23`) |
 | Get the latest version | `git pull && npm run up` |
-| Stop it | `npm run down` (starts again with `npm run up`) |
+| Stop it | `npm run down` (it stays stopped until `npm run up`) |
+| Turn the background check off / on | `npm run autostart:off` / `npm run autostart` |
 | Undo the MNG change | `npm run unwire` (puts the original config files back exactly) |
 
 ## If something goes wrong

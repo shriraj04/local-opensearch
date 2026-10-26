@@ -79,6 +79,20 @@ test('a failed batch that is retried keeps the same ids for identical entries', 
   assert.deepEqual(batch.map((raw) => docId(raw, fresh.next(raw))), firstTry); // same as a full re-read
 });
 
+test('continuing from a saved position gives the same ids as reading the whole list', () => {
+  const list = ['{"a":1}', '{"b":2}', '{"a":1}', '{"c":3}', '{"a":1}', '{"b":2}'];
+  const whole = new CopyCounter(4);
+  const all = list.map((raw) => docId(raw, whole.next(raw)));
+  // ship the first 3, save, "restart", continue
+  const first = new CopyCounter(4);
+  const head = list.slice(0, 3).map((raw) => docId(raw, first.next(raw)));
+  const savedRing = first.ring.slice();
+  const resumed = new CopyCounter(4);
+  resumed.load(savedRing);
+  const tail = list.slice(3).map((raw) => docId(raw, resumed.next(raw)));
+  assert.deepEqual([...head, ...tail], all);
+});
+
 test('monthIndex uses UTC', () => {
   assert.equal(monthIndex('nps-app-', Date.parse('2026-10-31T23:30:00-02:00')), 'nps-app-2026.11');
 });

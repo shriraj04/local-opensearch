@@ -24,6 +24,10 @@ export const config = {
   opensearchUrl: (env.OPENSEARCH_URL || 'http://astra-opensearch:9200').replace(/\/+$/, ''),
   indexPrefix: env.INDEX_PREFIX || 'nps-app-',
   rejectIndex: env.REJECT_INDEX || 'astra-shipper-rejected',
+  // Where the shipper keeps its position, so a restart (even after weeks) continues instead of re-reading
+  // the whole list. Kept in OpenSearch itself: if the data is wiped, the position goes with it.
+  stateIndex: env.STATE_INDEX || 'astra-shipper-state',
+  saveEveryMs: Number(env.SAVE_EVERY_MS || 2000),
   templateName: 'nps-app',
   batchSize: Number(env.BATCH_SIZE || 500),
   maxBatchBytes: Number(env.MAX_BATCH_BYTES || 8 * 1024 * 1024),
@@ -84,6 +88,14 @@ export class CopyCounter {
   restore(saved) {
     this.ring = saved.ring;
     this.counts = saved.counts;
+  }
+  /** Rebuilds the counter from a saved ring (oldest first). */
+  load(ring) {
+    this.clear();
+    for (const key of ring.slice(-this.size)) {
+      this.ring.push(key);
+      this.counts.set(key, (this.counts.get(key) || 0) + 1);
+    }
   }
 }
 
@@ -146,6 +158,20 @@ async function ensureIndexSetup() {
     if (put.status !== 200) throw new Error(`index template ${name} not accepted (${put.status}): ${put.text.slice(0, 300)}`);
   }
 
+  if ((await os('HEAD', `/${config.stateIndex}`)).status === 404) {
+    const made = await os(
+      'PUT',
+      `/${config.stateIndex}`,
+      JSON.stringify({
+        settings: { 'index.number_of_shards': 1, 'index.number_of_replicas': 0 },
+        mappings: { dynamic: false, properties: { saved_at: { type: 'date' } } },
+      }),
+    );
+    if (made.status !== 200 && !/resource_already_exists/.test(made.text)) {
+      throw new Error(`could not create ${config.stateIndex} (${made.status}): ${made.text.slice(0, 300)}`);
+    }
+  }
+
   const head = await os('HEAD', `/${config.rejectIndex}`);
   if (head.status === 404) {
     const created = await os(
@@ -174,11 +200,19 @@ async function ensureIndexSetup() {
 }
 
 // ---------- state shown on the status page ----------
+//
+// The list grows at BOTH ends: the portals RPUSH (tail) and n8n's Redis "push" node LPUSHes (head).
+// What is shipped is always one window [a, b) of the list. Entries n8n pushes appear before `a` (and move
+// the window: k pushes → [a + k, b + k)); entries the portals push appear after `b`. Each pass reads only
+// the new entries; the two ends of the window (hashA / hashB) prove where it is now.
 
 export const state = {
   startedAt: new Date().toISOString(),
-  offset: 0, // list position of the next entry to read
-  anchor: null, // sha1 of the entry just before `offset`, to notice the list being trimmed or reset
+  a: 0, // list index of the first shipped entry
+  b: 0, // list index just after the last shipped entry
+  hashA: null, // sha1 of the entry at a
+  hashB: null, // sha1 of the entry at b - 1
+  lastLen: 0, // list length when the window was last located
   listLength: null,
   caughtUpOnce: false,
   live: false,
@@ -197,26 +231,79 @@ export const state = {
 };
 
 const copies = new CopyCounter(config.dupWindow);
+const shippedCount = () => state.b - state.a;
 
 function resync(reason) {
   log(`re-reading the list from the start: ${reason}`);
-  state.offset = 0;
-  state.anchor = null;
-  state.live = false;
+  Object.assign(state, { a: 0, b: 0, hashA: null, hashB: null, lastLen: 0, live: false });
   state.resyncs += 1;
   copies.clear();
 }
 
+// ---------- the saved position ----------
+
+const stateDocPath = () => `/${config.stateIndex}/_doc/${encodeURIComponent(`${config.redisHost}:${config.redisPort}:${config.redisDb}:${config.listKey}`)}`;
+let lastSaved = { at: 0, key: '' };
+
+async function loadSavedPosition() {
+  const res = await os('GET', stateDocPath());
+  return res.status === 200 && res.json && res.json._source ? res.json._source : null;
+}
+
+async function savePosition(force = false) {
+  const key = `${state.a}:${state.b}:${state.lastLen}`;
+  if (!state.hashA || key === lastSaved.key) return;
+  if (!force && Date.now() - lastSaved.at < config.saveEveryMs) return;
+  try {
+    const res = await os(
+      'PUT',
+      stateDocPath(),
+      JSON.stringify({
+        version: 2,
+        a: state.a,
+        b: state.b,
+        hashA: state.hashA,
+        hashB: state.hashB,
+        lastLen: state.lastLen,
+        ring: copies.ring,
+        saved_at: new Date().toISOString(),
+      }),
+    );
+    if (res.status === 200 || res.status === 201) lastSaved = { at: Date.now(), key };
+  } catch {
+    /* OpenSearch down: saved on a later batch */
+  }
+}
+
+/** Takes up the saved window; the next pass proves it is still valid (or reads the list again). */
+async function resume() {
+  const saved = await loadSavedPosition();
+  if (!saved || saved.version !== 2 || !(saved.b > saved.a)) {
+    log('no saved position: reading the list from the start');
+    return;
+  }
+  Object.assign(state, {
+    a: saved.a,
+    b: saved.b,
+    hashA: saved.hashA,
+    hashB: saved.hashB,
+    lastLen: saved.lastLen,
+  });
+  copies.load(saved.ring || []);
+  lastSaved = { at: Date.now(), key: `${saved.a}:${saved.b}:${saved.lastLen}` };
+  log(`continuing from the saved position (${saved.b - saved.a} entries shipped, saved ${saved.saved_at})`);
+}
+
 // ---------- one batch ----------
 
-async function shipBatch(entries, firstListIndex) {
+async function shipBatch(entries, listIndexOf) {
   const now = Date.now();
   const lines = [];
   const meta = [];
   const rejects = [];
 
   entries.forEach((raw, i) => {
-    const listIndex = firstListIndex + i;
+    const listIndex = listIndexOf(i);
     const id = docId(raw, copies.next(raw));
     const doc = toDocument(raw, now);
     if (!doc.ok) {
@@ -285,66 +372,153 @@ async function shipBatch(entries, firstListIndex) {
   }
 }
 
-// ---------- the loop ----------
-
-async function readBatch(redis) {
-  const end = Math.min(state.listLength, state.offset + config.batchSize) - 1;
-  const entries = await redis.lrange(config.listKey, state.offset, end);
-  // keep a batch under maxBatchBytes (one huge entry still goes on its own)
-  let bytes = 0;
-  let take = 0;
-  for (const raw of entries) {
-    bytes += Buffer.byteLength(raw);
-    if (take > 0 && bytes > config.maxBatchBytes) break;
-    take += 1;
-  }
-  return entries.slice(0, take);
-}
-
-async function pass(redis) {
-  const length = await redis.llen(config.listKey);
-  state.redisOk = true;
-  state.listLength = length;
-
-  if (state.offset > 0) {
-    if (length < state.offset) {
-      resync(`the list got shorter (${state.offset} → ${length}): Redis was flushed, restored or trimmed`);
-    } else {
-      const before = await redis.lindex(config.listKey, state.offset - 1);
-      if (before === null || !sha1(before).equals(state.anchor)) {
-        resync('the entries already shipped are no longer where they were (list trimmed or replaced)');
-      }
-    }
-  }
-
-  if (state.offset >= length) {
-    if (!state.caughtUpOnce) log(`caught up: ${length} entries in the list, all in OpenSearch`);
-    state.caughtUpOnce = true;
-    state.live = true;
-    return false;
-  }
-
-  let entries = await readBatch(redis);
-  while (true) {
+/** Ships all `entries` (oldest first), in smaller bulk requests while OpenSearch says one is too large. */
+async function shipAll(entries, listIndexOf) {
+  let done = 0;
+  let size = entries.length;
+  while (done < entries.length) {
+    const batch = entries.slice(done, done + size);
     const saved = copies.snapshot();
     try {
-      await shipBatch(entries, state.offset);
-      break;
+      await shipBatch(batch, (i) => listIndexOf(done + i));
+      done += batch.length;
     } catch (err) {
       copies.restore(saved);
       if (!err.split) throw err;
-      entries = entries.slice(0, Math.max(1, Math.floor(entries.length / 2)));
+      size = Math.max(1, Math.floor(size / 2));
     }
   }
+}
+
+// ---------- the loop ----------
+
+// One atomic, read-only step inside Redis (EVAL_RO): find where the shipped window [a, b) is now
+// (n8n's head pushes move it) and return the next new entries, oldest first: after b (portals) or,
+// once those are done, before a (n8n). Nothing can push between "where am I" and "what is next".
+// Returns {len, k, side, firstHash, lastHash, entries...}: k = -1 when the window is gone (list
+// trimmed / flushed / restored); side 0 = nothing new, 1 = after b, 2 = before a.
+const STEP_LUA = `
+local key = KEYS[1]
+local a, b, lastLen = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local hashA, hashB = ARGV[4], ARGV[5]
+local maxCount, maxBytes = tonumber(ARGV[6]), tonumber(ARGV[7])
+local len = redis.call('LLEN', key)
+local k = 0
+if b > a then
+  k = -1
+  local grown = len - lastLen
+  local i = 0
+  while grown >= 0 and k < 0 and i <= grown do
+    local stop = math.min(i + 199, grown)
+    local cands = redis.call('LRANGE', key, a + i, a + stop)
+    if #cands == 0 then break end
+    for j = 1, #cands do
+      if redis.sha1hex(cands[j]) == hashA then
+        local last = redis.call('LINDEX', key, b - 1 + i + j - 1)
+        if last and redis.sha1hex(last) == hashB then k = i + j - 1 break end
+      end
+    end
+    i = stop + 1
+  end
+  if k < 0 then return {len, -1, 0, '', ''} end
+end
+local na, nb = a + k, b + k
+if b <= a then na, nb = 0, 0 end
+local out, bytes, side = {}, 0, 0
+local function take(item)
+  if #out > 0 and bytes + #item > maxBytes then return false end
+  out[#out + 1] = item
+  bytes = bytes + #item
+  return #out < maxCount
+end
+if nb < len then
+  side = 1
+  local i, more = nb, true
+  while more and i < len do
+    local items = redis.call('LRANGE', key, i, math.min(len, i + 50) - 1)
+    if #items == 0 then break end
+    for j = 1, #items do if not take(items[j]) then more = false break end end
+    i = i + #items
+  end
+elseif na > 0 then
+  side = 2
+  local i, more = na - 1, true
+  while more and i >= 0 do
+    local from = math.max(0, i - 49)
+    local items = redis.call('LRANGE', key, from, i)
+    for j = #items, 1, -1 do if not take(items[j]) then more = false break end end
+    i = from - 1
+  end
+end
+local res = {len, k, side, '', ''}
+if #out > 0 then res[4] = redis.sha1hex(out[1]) res[5] = redis.sha1hex(out[#out]) end
+for j = 1, #out do res[#res + 1] = out[j] end
+return res
+`;
+
+/** Runs one STEP_LUA for window `w` ({a, b, hashA, hashB, lastLen}). */
+export async function step(redis, w, maxCount, maxBytes) {
+  const r = await redis.call('EVAL_RO', STEP_LUA, 1, config.listKey, w.a, w.b, w.lastLen, w.hashA || '', w.hashB || '', maxCount, maxBytes);
+  const [len, k, side, firstHash, lastHash, ...entries] = r;
+  return { len: Number(len), k: Number(k), side: Number(side), firstHash, lastHash, entries };
+}
+
+/** Moves window `w` to where `step` found it, plus the entries it returned (now shipped). */
+export function advance(w, r) {
+  const empty = w.b <= w.a;
+  const na = empty ? 0 : w.a + r.k;
+  const nb = empty ? 0 : w.b + r.k;
+  const n = r.entries.length;
+  w.lastLen = r.len;
+  if (r.side === 1) {
+    Object.assign(w, { a: na, b: nb + n, hashB: r.lastHash });
+    if (empty) w.hashA = r.firstHash;
+  } else if (r.side === 2) {
+    Object.assign(w, { a: na - n, b: nb, hashA: r.lastHash });
+  } else Object.assign(w, { a: na, b: nb });
+  return { from: r.side === 1 ? nb : na - 1, dir: r.side === 1 ? 1 : -1 };
+}
+
+function noteShipped(newestRaw) {
   state.opensearchOk = true;
-  state.offset += entries.length;
-  state.anchor = sha1(entries[entries.length - 1]);
   state.lastShippedAt = new Date().toISOString();
   try {
-    state.lastEntryTs = JSON.parse(entries[entries.length - 1]).ts || state.lastEntryTs;
+    const ts = JSON.parse(newestRaw).ts;
+    if (ts && (!state.lastEntryTs || ts > state.lastEntryTs)) state.lastEntryTs = ts;
   } catch {
     /* not JSON: already recorded as rejected */
   }
+}
+
+async function pass(redis) {
+  const r = await step(redis, state, config.batchSize, config.maxBatchBytes);
+  state.redisOk = true;
+  state.listLength = r.len;
+  if (r.k === -1) {
+    resync(r.len < state.lastLen ? `the list got shorter (${state.lastLen} → ${r.len}): Redis was flushed, restored or trimmed` : 'the entries already shipped are no longer where they were (list trimmed or replaced)');
+    return true;
+  }
+  if (r.side === 0) {
+    advance(state, r);
+    if (!state.caughtUpOnce) log(`caught up: ${r.len} entries in the list, all in OpenSearch`);
+    state.caughtUpOnce = true;
+    state.live = true;
+    await savePosition(true);
+    return false;
+  }
+  // ship first, then move the window: a failed send is simply read again next pass
+  const { a, b, hashA, hashB, lastLen } = state;
+  const where = advance({ a, b, hashA, hashB, lastLen }, r);
+  const counted = copies.snapshot();
+  try {
+    await shipAll(r.entries, (i) => where.from + where.dir * i);
+  } catch (err) {
+    copies.restore(counted); // the whole step is read again next pass, with the same copy numbers
+    throw err;
+  }
+  advance(state, r);
+  noteShipped(r.entries[r.entries.length - 1]);
+  await savePosition();
   return true;
 }
 
@@ -389,6 +563,15 @@ export async function run() {
   startStatusServer();
   log(`shipping redis://${config.redisHost}:${config.redisPort}/${config.redisDb} list "${config.listKey}" → ${config.opensearchUrl} ${config.indexPrefix}YYYY.MM`);
   await waitForOpenSearch();
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await resume();
+      break;
+    } catch (err) {
+      noteError(`reading the saved position: ${err.message}`, attempt % 10 === 0);
+      await sleep(Math.min(5000, 500 + attempt * 500));
+    }
+  }
 
   let failures = 0;
   let stopping = false;
@@ -410,12 +593,14 @@ export async function run() {
       if (/fetch failed|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|bulk request failed|busy/.test(err.message)) {
         state.opensearchOk = false;
         await waitForOpenSearch();
-        // OpenSearch may have come back empty (volume removed): read the list again; existing entries are skipped.
-        if (failures === 1) resync('OpenSearch was unreachable');
+        // Came back without our saved position = its data was removed: read the list again.
+        const saved = await loadSavedPosition().catch(() => null);
+        if (shippedCount() > 0 && !saved) resync('OpenSearch came back without its data');
       }
       await sleep(Math.min(5000, 250 * 2 ** Math.min(failures, 5)));
     }
   }
+  await savePosition(true);
   redis.disconnect();
   log('stopped');
   process.exit(0);
@@ -424,12 +609,12 @@ export async function run() {
 // ---------- status page (http://127.0.0.1:9700) ----------
 
 export function statusSnapshot() {
-  const lag = state.listLength === null ? null : Math.max(0, state.listLength - state.offset);
+  const lag = state.listLength === null ? null : Math.max(0, state.listLength - shippedCount());
   return {
     ok: state.redisOk && state.opensearchOk && lag !== null && lag < 1000,
     redis: { host: config.redisHost, list: config.listKey, connected: state.redisOk, length: state.listLength },
     opensearch: { url: config.opensearchUrl, reachable: state.opensearchOk, indices: `${config.indexPrefix}*` },
-    shipped: state.offset,
+    shipped: shippedCount(),
     lag,
     live: state.live,
     created: state.created,
@@ -447,20 +632,32 @@ export function statusSnapshot() {
 }
 
 /**
- * Exact check: every entry now in the Redis list has its document in OpenSearch, once. Reads the list in
- * chunks and keeps only ids, so memory stays small however long the list is.
+ * Exact check: every entry in the Redis list has its document in OpenSearch, once. Walks the list with the
+ * same atomic steps as the shipper (so entries pushed meanwhile cannot shift the walk), keeping only ids.
  * Documents not in the list are history (Redis trimmed or flushed) — or duplicates, which `sample` shows.
  */
 async function parity() {
   const redis = new Redis({ host: config.redisHost, port: config.redisPort, db: config.redisDb, maxRetriesPerRequest: 2 });
   try {
-    const expected = new Set();
-    const counter = new CopyCounter(config.dupWindow);
-    const length = await redis.llen(config.listKey);
-    for (let start = 0; start < length; start += 5000) {
-      const chunk = await redis.lrange(config.listKey, start, Math.min(length, start + 5000) - 1);
-      for (const raw of chunk) expected.add(docId(raw, counter.next(raw)));
+    let expected;
+    let length = 0;
+    for (let attempt = 0; attempt < 3 && !expected; attempt += 1) {
+      const w = { a: 0, b: 0, hashA: '', hashB: '', lastLen: 0 };
+      const counter = new CopyCounter(config.dupWindow);
+      const ids = new Set();
+      for (;;) {
+        const r = await step(redis, w, 5000, 32 * 1024 * 1024);
+        if (r.k === -1) break; // list replaced under us: start again
+        advance(w, r);
+        for (const raw of r.entries) ids.add(docId(raw, counter.next(raw)));
+        if (r.side === 0) {
+          expected = ids;
+          length = r.len;
+          break;
+        }
+      }
     }
+    if (!expected) throw new Error('the list kept changing under the check; try again');
     let missing = expected.size;
     let extra = 0;
     const sample = [];
@@ -548,3 +745,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(1);
   });
 }
+
+// for tests
+export { pass as _pass, resync as _resync, copies as _copies, parity as _parity };

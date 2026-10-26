@@ -7,7 +7,8 @@
 //   npm run trace -- tx 189444            Transaction Trace      (also: notes 189444, account 140,
 //                                          internal-notes 2026-10-01 2026-10-23, wl-trace 189444)
 //   npm run logs [-- shipper|opensearch|dashboards] [-- -f]
-//   npm run down               stop the containers (data is kept)
+//   npm run down               stop the containers (data is kept); stays stopped until npm run up
+//   npm run autostart[:off]    background check at login + every 10 min that repairs it (setup turns it on)
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -36,6 +37,11 @@ const APPS = [
   { app: 'wl-mng', container: 'nps_wl-mng_web', domain: 'qa-alpha-astrawlmng.local' },
 ];
 const CONTAINERS = ['astra-opensearch', 'astra-opensearch-dashboards', 'astra-log-shipper'];
+const SERVICE_OF = { 'astra-opensearch': 'opensearch', 'astra-opensearch-dashboards': 'dashboards', 'astra-log-shipper': 'shipper' };
+const RUN_DIR = path.join(ROOT, '.run');
+const STOPPED_MARK = path.join(RUN_DIR, 'stopped');
+const GUARD = 'local-opensearch-guard';
+const UNIT_DIR = path.join(os.homedir(), '.config', 'systemd', 'user');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmt = (n) => (n === null || n === undefined ? '–' : Number(n).toLocaleString('en-US'));
@@ -307,6 +313,7 @@ function sha512File(file) {
 
 async function up({ fromSetup = false } = {}) {
   console.log('Starting ASTRA Local OpenSearch\n');
+  fs.rmSync(STOPPED_MARK, { force: true });
   if (run('docker', ['info', '--format', '{{.ServerVersion}}']).status !== 0) fail('Docker is not running.');
   if (run('docker', ['network', 'inspect', 'nps_default']).status !== 0) {
     fail('The ASTRA docker network nps_default does not exist — start the local ASTRA stack first.');
@@ -378,7 +385,9 @@ async function up({ fromSetup = false } = {}) {
 function down() {
   const r = compose(['stop'], { stdio: 'inherit' });
   if (r.status !== 0) fail('docker compose stop failed.');
-  console.log('\nStopped. Data is kept; `npm run up` starts it again.');
+  fs.mkdirSync(RUN_DIR, { recursive: true });
+  fs.writeFileSync(STOPPED_MARK, `${new Date().toISOString()}\n`);
+  console.log('\nStopped. Data is kept, and it stays stopped (also after a restart) until `npm run up`.');
   const wired = APPS.map(({ app }) => wiringState(app)).filter((s) => s.wired);
   if (wired.length) console.log(`Note: ${wired.map((s) => s.app).join(' and ')} still point at the local OpenSearch; trace screens will error until it is up (or run: npm run unwire).`);
 }
@@ -409,6 +418,8 @@ async function status({ short = false, hideWiring = false } = {}) {
     else if (w.wired) ok(`${app}: wired → reads traces from this local OpenSearch`);
     else warn(`${app}: not wired (OPS_URL = ${hostOf(w.url)}) — run: npm run wire`);
   }
+  const guardOn = run('systemctl', ['--user', 'is-active', `${GUARD}.timer`]).stdout.trim() === 'active';
+  (guardOn ? ok : warn)(guardOn ? 'Background check: on (at login and every 10 minutes)' : 'Background check: off — turn it on with: npm run autostart');
   console.log(`\n  Status & lookup page:   ${SHIP}`);
   console.log(`  OpenSearch Dashboards:  ${DASH}/app/data-explorer/discover`);
   console.log(`  OpenSearch API:         ${OS}`);
@@ -599,6 +610,105 @@ async function doctor() {
   return problems;
 }
 
+// ---------- keeping it running (background check) ----------
+
+/**
+ * Run by the background check at login and every 10 minutes. Docker already restarts the containers after a
+ * reboot; this repairs what Docker cannot: containers removed (e.g. a docker cleanup), or cut off from the
+ * ASTRA network when a redeploy recreated nps_default. Does nothing after `npm run down`. Never touches MNG config.
+ */
+async function ensure() {
+  const say = (m) => console.log(`${new Date().toISOString()} ${m}`);
+  if (fs.existsSync(STOPPED_MARK)) return say('stopped on purpose (npm run down): nothing to do');
+  if (run('docker', ['info', '--format', '{{.ServerVersion}}']).status !== 0) return say('Docker is not running yet: checking again later');
+  if (run('docker', ['network', 'inspect', 'nps_default']).status !== 0 || !containerState('nps_redis').startsWith('running')) {
+    return say('the local ASTRA stack is not running: nothing to do until it is');
+  }
+  const broken = [];
+  for (const c of CONTAINERS) {
+    const st = containerState(c);
+    const nets = st === 'missing' ? '' : run('docker', ['inspect', c, '--format', '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}']).stdout;
+    if (st === 'missing' || !st.startsWith('running') || st.includes('unhealthy') || !nets.includes('nps_default')) {
+      broken.push({ c, why: st === 'missing' ? 'missing' : !nets.includes('nps_default') ? 'not on the ASTRA network' : st });
+    }
+  }
+  if (!broken.length) {
+    // Shipper up for a while but still cannot reach Redis / OpenSearch?
+    const s = (await tryJson(`${SHIP}/status`))?.json;
+    if (s && Date.now() - Date.parse(s.started_at) > 120_000 && (!s.redis.connected || !s.opensearch.reachable)) {
+      broken.push({ c: 'astra-log-shipper', why: `cannot reach ${!s.redis.connected ? 'Redis' : 'OpenSearch'}` });
+    }
+  }
+  if (!broken.length) return say('all running');
+
+  say(`repairing: ${broken.map((b) => `${b.c} (${b.why})`).join(', ')}`);
+  const imagesMissing = ['astra-log-shipper:local', `astra-opensearch:${setting('OPENSEARCH_VERSION', '2.19.6')}-local`].some(
+    (img) => run('docker', ['image', 'inspect', img]).status !== 0,
+  );
+  if (imagesMissing) {
+    await up();
+    return;
+  }
+  const r = compose(['up', '-d', '--force-recreate', ...broken.map((b) => SERVICE_OF[b.c])], { stdio: 'inherit' });
+  if (r.status !== 0) fail('repair failed (see above); run: npm run up');
+  const back = await waitFor('back to normal', async () => {
+    const s = (await tryJson(`${SHIP}/status`))?.json;
+    return s && s.redis.connected && s.opensearch.reachable ? s : null;
+  }, 180_000, 3000);
+  say(back ? 'repaired' : 'still not right after 3 minutes; run: npm run doctor');
+}
+
+function autostart(on = true) {
+  const service = path.join(UNIT_DIR, `${GUARD}.service`);
+  const timer = path.join(UNIT_DIR, `${GUARD}.timer`);
+  if (run('systemctl', ['--user', 'show-environment']).status !== 0) {
+    warn('systemd user services are not available here, so there is no background check. Docker still restarts it after a reboot.');
+    return false;
+  }
+  if (!on) {
+    run('systemctl', ['--user', 'disable', '--now', `${GUARD}.timer`]);
+    fs.rmSync(service, { force: true });
+    fs.rmSync(timer, { force: true });
+    run('systemctl', ['--user', 'daemon-reload']);
+    ok('Background check turned off');
+    return true;
+  }
+  fs.mkdirSync(UNIT_DIR, { recursive: true });
+  fs.writeFileSync(
+    service,
+    `[Unit]
+Description=Local OpenSearch for ASTRA traces: check it is running and repair it if not
+
+[Service]
+Type=oneshot
+WorkingDirectory=${ROOT}
+ExecStart=${process.execPath} ${path.join(ROOT, 'scripts', 'cli.mjs')} ensure
+`,
+  );
+  fs.writeFileSync(
+    timer,
+    `[Unit]
+Description=Check Local OpenSearch at login and every 10 minutes
+
+[Timer]
+OnStartupSec=90s
+OnUnitActiveSec=10min
+Unit=${GUARD}.service
+
+[Install]
+WantedBy=timers.target
+`,
+  );
+  run('systemctl', ['--user', 'daemon-reload']);
+  const en = run('systemctl', ['--user', 'enable', '--now', `${GUARD}.timer`]);
+  if (en.status !== 0) {
+    warn(`could not turn on the background check: ${en.stderr.trim()}`);
+    return false;
+  }
+  ok('Background check on: at login and every 10 minutes it makes sure everything runs (log: journalctl --user -u local-opensearch-guard)');
+  return true;
+}
+
 // ---------- setup: the whole first-time setup in one command ----------
 
 /** Everything this laptop needs, as plain-English checks with the fix for each one that fails. */
@@ -672,6 +782,9 @@ async function setup() {
     else warn('Skipped. Run  npm run wire  whenever you want to connect them.');
   }
 
+  console.log('\nKeeping it running after restarts\n');
+  autostart(true);
+
   console.log('\nStep 4 of 4 — Testing it end to end');
   const problems = await doctor();
   if (problems) {
@@ -685,7 +798,7 @@ You're all set!
   Dashboards:      ${DASH}   (same screen as mnops.cdmx.io, for your local data)
   Quick lookup:    ${SHIP}
 
-It starts by itself whenever your laptop starts. To update later:  git pull && npm run setup`);
+It starts by itself whenever your laptop starts, even after weeks off. To update later:  git pull && npm run setup`);
 }
 
 // ---------- main ----------
@@ -694,6 +807,9 @@ const [cmd, ...args] = process.argv.slice(2);
 const commands = {
   setup,
   up,
+  ensure,
+  autostart: () => autostart(true),
+  'autostart:off': () => autostart(false),
   down,
   status: () => status(),
   doctor,
