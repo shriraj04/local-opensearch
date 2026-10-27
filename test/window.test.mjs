@@ -21,6 +21,7 @@ after(() => container && docker('rm', '-f', container));
 process.env.BATCH_SIZE = '4'; // small steps, so pushes land in the middle of a read
 process.env.SAVE_EVERY_MS = '0';
 process.env.RETENTION_DAYS = '5';
+process.env.LARGE_ENTRY_BYTES = '1000'; // "very large" in these tests (19 MB e-mails in real life)
 process.env.REDIS_HOST = '127.0.0.1';
 process.env.REDIS_PORT = String(port || 6379);
 const shipper = await import('../shipper/index.mjs');
@@ -32,6 +33,7 @@ const KEY = 'nps-logs';
 
 // Simulated OpenSearch: records every create (409 when the id exists) and serves the ids back to a scroll.
 const store = new Map();
+const sentTo = new Map(); // id -> every index a create for it was sent to, in order
 let creates = 0;
 let conflicts = 0;
 let refuseRejected = 0; // > 0: the next writes to the rejected index are refused (disk nearly full)
@@ -45,6 +47,7 @@ globalThis.fetch = async (url, init = {}) => {
     for (let i = 0; i < lines.length; i += 2) {
       const action = JSON.parse(lines[i]);
       const { _id: id, _index: index } = action.create || action.index;
+      sentTo.set(id, [...(sentTo.get(id) || []), index]);
       if (index === 'astra-shipper-rejected' && refuseRejected > 0) {
         refuseRejected -= 1;
         const reason = `index [${index}] blocked by: [TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark, index has read-only-allow-delete block];`;
@@ -93,6 +96,7 @@ async function drain(between) {
 }
 async function reset(items) {
   store.clear();
+  sentTo.clear();
   creates = 0;
   conflicts = 0;
   resync('test');
@@ -200,6 +204,17 @@ test('a rejected entry that cannot be recorded yet (disk nearly full) is retried
   const p = await parity();
   assert.equal(p.missing_in_opensearch, 0);
   assert.equal(p.rejected_entries, 1);
+});
+
+test('a very large entry (an e-mail with attachments) goes straight to the fallback index', { skip }, async () => {
+  const big = JSON.stringify({ ts: new Date().toISOString(), e_event: 'EMAIL_SENT', aux: { attachment: 'x'.repeat(2000) } });
+  await reset([entry(1, 'a'), big, entry(2, 'b')]);
+  await drain();
+  const [bigId, bigIndex] = [...store].find(([, index]) => index.endsWith('-fallback'));
+  assert.deepEqual(sentTo.get(bigId), [bigIndex], 'never sent to the daily index first');
+  assert.equal([...store.values()].filter((index) => /^nps-app-\d{4}\.\d{2}\.\d{2}$/.test(index)).length, 2, 'the others in the daily index');
+  const p = await parity();
+  assert.equal(p.missing_in_opensearch, 0);
 });
 
 test('older days are removed by themselves (daily indices)', { skip }, async () => {

@@ -7,7 +7,7 @@ description: Set up, update, check, connect (wire) or disconnect (unwire) Local 
 
 Local OpenSearch copies every log line the local ASTRA apps write to Redis `nps-logs` into a local OpenSearch, the way remote `nps-app-*` (mnops.cdmx.io) is filled. MNG and WL-MNG then read their trace and notes screens from it.
 
-- **Containers:** `astra-opensearch`, `astra-opensearch-dashboards`, `astra-log-shipper`. They are capped, use about 0.85 GB of RAM in total and almost no CPU when idle, and OpenSearch pauses writing when less than 2 GB of disk is free.
+- **Containers:** `astra-opensearch`, `astra-opensearch-dashboards`, `astra-log-shipper`. They are capped, use about 0.35 to 0.45 GB of RAM in total (OpenSearch never more than 500 MB) and almost no CPU when idle, and OpenSearch pauses writing when less than 2 GB of disk is free.
 - **Commands:** everything is driven by `npm run <command>` inside the repo folder.
 
 **Repo folder (`$LOS`):** the folder this skill comes from, since this file is `$LOS/.claude/skills/local-opensearch/SKILL.md`. If the skill was loaded through the link in `~/.claude/skills`, resolve it:

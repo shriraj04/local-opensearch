@@ -44,19 +44,32 @@ Each container has a CPU and memory ceiling, so it can never take over the lapto
 
 | Container | Limit | Measured |
 | --- | --- | --- |
-| `astra-opensearch` | 1.5 CPU, 1 GB (Java heap 512 MB) | about 690 MB; about 1% of one CPU when idle |
-| `astra-opensearch-dashboards` | 1 CPU, 1 GB | about 120 MB; about 0% when idle |
+| `astra-opensearch` | 1.5 CPU, **500 MB** (Java heap 64 MB, growing to at most 320 MB) | about 160 MB empty, 200 to 260 MB in use; at most about 420 MB while it stores or shows 19 MB entries, back to about 200 MB a minute later; under 1% of one CPU when idle |
+| `astra-opensearch-dashboards` | 1 CPU, 1 GB | about 120 MB, 150 MB in use; up to about 420 MB while Discover shows 19 MB entries, then back to 120 MB; about 0% when idle |
 | `astra-log-shipper` | 0.5 CPU, 256 MB | about 25 MB, up to about 120 MB after copying very large entries (emails with attachments, up to 19 MB each) or a doctor run; under 1% CPU when idle |
 
-In total that is about 0.85 GB of RAM. Before it was slimmed down (27 Oct 2026) it was about 1.3 GB, with OpenSearch at about 1 GB and 5% of one CPU when idle. How it is kept light:
+In total that is about 0.35 to 0.45 GB of RAM, and OpenSearch itself can never use more than 500 MB. It was about 1.3 GB before it was slimmed down (27 Oct 2026), with OpenSearch at about 1 GB. How it is kept light:
 
-- **OpenSearch's Java heap is 512 MB.** The trace data needs a few tens of MB. Tested with the real data plus 19 MB email entries: 512 MB stores and searches them without refusing any; 384 MB refused each one once (the shipper retries, so nothing is lost) and 256 MB crashed. Change it with `OPENSEARCH_HEAP` in `.env`.
-- **Only Java's quick compiler** (`-XX:TieredStopAtLevel=1`): less memory and about half the idle CPU. MNG's lookups are just as fast; a few heavier operations are a little slower (see the table below).
-- **No GC log files** grow inside the OpenSearch container. JVM warnings go to Docker's capped log.
-- **Dashboards runs without its 15 bundled plugins** (alerting, anomaly detection, ML, SQL workbench, reports, security analytics, …). Each one needs an OpenSearch plugin this node does not have, and everything used here is built in: Discover, dashboards, and the Vega, markdown and metric panels. That saves about 70 MB. They are removed when the container is created; the image itself is unchanged.
+- **OpenSearch's Java heap starts at 64 MB, grows only when needed, up to 320 MB, and is given back** within about a minute when idle. The trace data needs a few tens of MB. Change the ceiling with `OPENSEARCH_HEAP` in `.env` (`npm run up` warns if it does not fit in `OPENSEARCH_MEM_LIMIT`).
+- **Very large entries go straight to the fallback index.** An email with attachments can be a 19 MB entry. In the daily index OpenSearch expands all of it in memory (inside `aux`) only to refuse it anyway: one such entry crashed a 320 MB heap, and needed a 512 MB one before. The fallback index stores it whole with memory to spare, and MNG finds it the same way (only its fields outside the MNG trace fields are not searchable). The shipper does this for every entry over 1 MB (`LARGE_ENTRY_BYTES`); today's real entries are at most about 15 KB.
+- **Only Java's quick compiler** (`-XX:TieredStopAtLevel=1`): less memory and about half the idle CPU. MNG's lookups are just as fast; a few heavier operations are a little slower (see the last table).
+- **No GC log files** grow inside the OpenSearch container. JVM warnings go to Docker's capped log. Java's own threads share 2 native memory pools (`MALLOC_ARENA_MAX=2`).
+- **Dashboards runs without its 15 bundled plugins** (alerting, anomaly detection, ML, SQL workbench, reports, security analytics, …). Each one needs an OpenSearch plugin this node does not have, and everything used here is built in: Discover, dashboards, and the Vega, markdown and metric panels. That saves about 70 MB. They are removed when the container is created; the image itself is unchanged. Its JavaScript heap keeps a small young generation (`--max-semi-space-size=4`) and 512 MB of old space, which a Discover page with three 19 MB entries needs (256 MB crashed).
 - **The home dashboard's health is updated every 30 s**, as often as the dashboard refreshes itself, instead of every 15 s.
 
-Checked before and after (27 Oct 2026), on the same real data with three 19 MB email entries added, with OpenSearch limited to 2 CPU cores and Dashboards loaded in headless Chrome (medians):
+Checked with exactly these settings (27 Oct 2026), on the real data of the last 5 days (79,705 entries) plus three 19 MB email entries (attachment in `aux`, in a nested object and in `msg`), each container held to its limit:
+
+| What | Result |
+| --- | --- |
+| Copying the 5 days after a start | 11 s, nothing refused |
+| MNG lookups through MNG's own code (Transaction Trace, Notes, Account Trace, Internal Notes, WL-MNG trace), 124 of them | all answered, median 7 ms |
+| The three 19 MB entries | stored (in the fallback index), each found by its Transaction Trace (a 19 MB answer, 0.7 s) |
+| Discover through Dashboards, 500 newest rows including the three 19 MB entries (a 55 MB page) | 1.1 to 1.8 s |
+| Exact check (every Redis entry in OpenSearch, once) | 0 missing |
+| Crashes, memory breaker trips, restarts | none |
+| OpenSearch memory: empty / in use / highest / a minute after the 19 MB entries | 160 / 260 / 390 MB / 200 MB |
+
+The first slimming step (heap 768 MB to a fixed 512 MB, quick compiler, plugins removed), checked before and after on the same real data with three 19 MB email entries added, with OpenSearch limited to 2 CPU cores and Dashboards loaded in headless Chrome (medians):
 
 | What | Before | After |
 | --- | --- | --- |
@@ -173,4 +186,4 @@ Notes on reading the screens:
 
 ## Settings
 
-Copy `.env.example` to `.env` to change ports, the OpenSearch version, memory (`OPENSEARCH_HEAP`, default `512m`; CPU/memory caps `OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, …) the ASTRA checkout (`ASTRA_REPO`, default `~/payment_system`), how many days to keep (`RETENTION_DAYS`), the free-disk limit (`DISK_MIN_FREE_GB`, default `2`) or the Java for the first build (`JAVA_HOME`). Run `npm run up` afterwards.
+Copy `.env.example` to `.env` to change ports, the OpenSearch version, memory (`OPENSEARCH_HEAP`, default `320m`; CPU/memory caps `OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, …) the ASTRA checkout (`ASTRA_REPO`, default `~/payment_system`), how many days to keep (`RETENTION_DAYS`), the free-disk limit (`DISK_MIN_FREE_GB`, default `2`) or the Java for the first build (`JAVA_HOME`). Run `npm run up` afterwards.

@@ -89,6 +89,13 @@ function readDotEnv(file) {
   }
 }
 
+/** A Docker / Java size such as 320m, 1g or 1536M in MB (0 when it cannot be read). */
+function megabytes(size) {
+  const m = String(size).trim().match(/^(\d+(?:\.\d+)?)\s*([kmg]?)b?$/i);
+  if (!m) return 0;
+  return Math.round(Number(m[1]) * { k: 1 / 1024, m: 1, g: 1024, '': 1 / 1048576 }[m[2].toLowerCase()]);
+}
+
 function run(cmd, args, opts = {}) {
   return spawnSync(cmd, args, { encoding: 'utf8', cwd: ROOT, ...opts });
 }
@@ -343,6 +350,12 @@ async function up({ fromSetup = false } = {}) {
     const users = run('docker', ['ps', '--filter', `publish=${port}`, '--format', '{{.Names}}']).stdout.trim().split('\n').filter(Boolean);
     const busy = run('bash', ['-c', `ss -ltnH 'sport = :${port}' | head -1`]).stdout.trim();
     if (busy && !users.some((u) => CONTAINERS.includes(u))) fail(`port ${port} is already used by another program. Pick another one in .env, e.g. ${name}=${Number(port) + 1}`);
+  }
+  // Java needs about 180 MB besides its heap; with less, Docker stops OpenSearch whenever the heap fills up.
+  const heap = setting('OPENSEARCH_HEAP', '320m');
+  const limit = setting('OPENSEARCH_MEM_LIMIT', '500m');
+  if (megabytes(heap) && megabytes(limit) && megabytes(heap) + 180 > megabytes(limit)) {
+    warn(`OPENSEARCH_HEAP=${heap} does not fit in OPENSEARCH_MEM_LIMIT=${limit}: set OPENSEARCH_MEM_LIMIT to at least ${megabytes(heap) + 180}m in .env (or remove both to use the defaults)`);
   }
 
   // OpenSearch image: built once (or when its Dockerfile/config change); can also be loaded ready-made (SETUP.md).

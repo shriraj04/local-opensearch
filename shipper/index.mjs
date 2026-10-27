@@ -40,6 +40,12 @@ export const config = {
   templateName: 'nps-app',
   batchSize: Number(env.BATCH_SIZE || 500),
   maxBatchBytes: Number(env.MAX_BATCH_BYTES || 8 * 1024 * 1024),
+  // An entry larger than this (e-mails with attachments reach 19 MB) goes straight to <index>-fallback.
+  // The daily index makes OpenSearch expand all of it in memory (aux is a flat_object) only to refuse a
+  // value that long anyway: for one 19 MB entry that crashed a 320 MB Java heap, while the fallback index
+  // stores it with memory to spare. It is kept whole, only its fields outside the fallback mapping are not
+  // searchable (the MNG trace fields are). 0 = off.
+  largeEntryBytes: Number(env.LARGE_ENTRY_BYTES ?? 1024 * 1024),
   pollMs: Number(env.POLL_MS || 250),
   // An entry read within this long of its own ts is "live": @timestamp is the time it was shipped,
   // like remote (about 0.1 s after ts). An older one is backlog: @timestamp = ts.
@@ -399,6 +405,7 @@ async function shipBatch(entries, listIndexOf) {
   const cutoff = effectiveCutoff(now);
   const lines = [];
   const meta = [];
+  const large = { lines: [], meta: [] };
   const rejects = [];
 
   entries.forEach((raw, i) => {
@@ -413,16 +420,25 @@ async function shipBatch(entries, listIndexOf) {
       rejects.push({ raw, listIndex, id, index: null, reason: doc.reason });
       return;
     }
+    if (config.largeEntryBytes > 0 && Buffer.byteLength(raw) > config.largeEntryBytes) {
+      const index = `${doc.index}-fallback`;
+      large.lines.push(JSON.stringify({ create: { _index: index, _id: id } }), doc.body);
+      large.meta.push({ raw, listIndex, id, index, firstReason: `larger than ${config.largeEntryBytes} bytes: sent to the fallback index directly` });
+      return;
+    }
     lines.push(JSON.stringify({ create: { _index: doc.index, _id: id } }), doc.body);
     meta.push({ raw, listIndex, id, index: doc.index });
   });
 
   // First the daily index; an entry it refuses (e.g. a value too long to index inside aux) goes,
   // unchanged, to <index>-fallback where aux is stored but not indexed; only if that refuses too is it
-  // recorded as rejected.
+  // recorded as rejected. Very large entries go to <index>-fallback directly (config.largeEntryBytes).
   let pending = lines.length ? { lines, meta } : null;
   for (const target of ['primary', 'fallback']) {
-    if (!pending) break;
+    if (target === 'fallback' && large.lines.length) {
+      pending = { lines: [...(pending?.lines || []), ...large.lines], meta: [...(pending?.meta || []), ...large.meta] };
+    }
+    if (!pending) continue;
     const res = await os('POST', '/_bulk', `${pending.lines.join('\n')}\n`, 'application/x-ndjson');
     if (res.status === 413 && entries.length > 1) {
       const err = new Error('batch too large');

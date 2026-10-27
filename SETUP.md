@@ -105,4 +105,4 @@ npm run up
 
 ## Resources
 
-It is capped so it cannot slow your laptop down. In total it is about 0.85 GB of RAM and almost no CPU when idle, and OpenSearch pauses writing when less than 2 GB of disk is free; README → "Resources" has the details.
+It is capped so it cannot slow your laptop down. In total it is about 0.35 to 0.45 GB of RAM (OpenSearch never more than 500 MB) and almost no CPU when idle, and OpenSearch pauses writing when less than 2 GB of disk is free; README → "Resources" has the details.

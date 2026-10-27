@@ -87,7 +87,7 @@ The setup does everything for you:
 | | |
 |---|---|
 | 🔁 **Starts by itself** | Restarts, weeks switched off, Redis restarts: it picks up where it stopped. A small check at login and every 10 minutes repairs anything Docker cannot. |
-| 🪶 **Light** | Under 1 GB of memory and almost no CPU when idle. On disk it keeps only the **last 5 days** of traces (a few MB) and removes older days by itself. |
+| 🪶 **Light** | About 0.4 GB of memory (OpenSearch never more than 500 MB) and almost no CPU when idle. On disk it keeps only the **last 5 days** of traces (a few MB) and removes older days by itself. |
 | 🧹 **Free space now** | The red **Clear all trace data** button on the Dashboards home page, or `npm run clear` |
 | 🗑️ **Remove it completely** | `npm run remove` (asks first; frees about 2.3 GB, including the Docker images) |
 | ⬆️ **Update** | `git pull --ff-only && npm run setup` |

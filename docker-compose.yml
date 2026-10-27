@@ -25,14 +25,18 @@ services:
     container_name: astra-opensearch
     restart: unless-stopped
     environment:
-      # Kept light, measured with the real trace data plus 19 MB email entries (README "Resources"):
-      # - heap 512 MB: the data needs a few tens of MB; 512 MB stores and searches the 19 MB entries
-      #   without tripping a memory breaker (384 MB tripped one on each; 256 MB crashed);
+      # Under 500 MB, measured with the real trace data plus 19 MB email entries (README "Resources"):
+      # - heap from 64 MB, growing only when needed, up to 320 MB (OPENSEARCH_HEAP), and given back
+      #   within about a minute when idle (G1PeriodicGCInterval + Min/MaxHeapFreeRatio). The data needs a
+      #   few tens of MB; 320 MB stores and searches 19 MB entries because the shipper sends entries over
+      #   1 MB straight to the fallback index (in the daily index one of them crashed a 320 MB heap);
       # - TieredStopAtLevel=1: only the quick Java compiler, so less memory and half the idle CPU;
-      # - -Xlog: no GC log files growing inside the container, only JVM warnings in Docker's capped log.
-      - OPENSEARCH_JAVA_OPTS=-Xms${OPENSEARCH_HEAP:-512m} -Xmx${OPENSEARCH_HEAP:-512m} -XX:TieredStopAtLevel=1 -Xlog:disable -Xlog:all=warning:stderr
+      # - -Xlog: no GC log files growing inside the container, only JVM warnings in Docker's capped log;
+      # - MALLOC_ARENA_MAX=2: fewer native memory pools for Java's own threads.
+      - OPENSEARCH_JAVA_OPTS=-Xms64m -Xmx${OPENSEARCH_HEAP:-320m} -XX:-AlwaysPreTouch -XX:G1PeriodicGCInterval=30000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30 -XX:TieredStopAtLevel=1 -Xlog:disable -Xlog:all=warning:stderr
+      - MALLOC_ARENA_MAX=2
     cpus: ${OPENSEARCH_CPUS:-1.5}
-    mem_limit: ${OPENSEARCH_MEM_LIMIT:-1g}
+    mem_limit: ${OPENSEARCH_MEM_LIMIT:-500m}
     logging: *logging
     ulimits:
       nofile: { soft: 65536, hard: 65536 }
@@ -68,7 +72,9 @@ services:
       - OPENSEARCH_HOSTS=["http://astra-opensearch:9200"]
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
       - SERVER_NAME=astra-local-opensearch
-      - NODE_OPTIONS=--max-old-space-size=512
+      # 512 MB of old space: a Discover page with three 19 MB entries needs it (256 MB crashed);
+      # a small young generation (semi-space 4 MB) keeps it at about 120 MB otherwise.
+      - NODE_OPTIONS=--max-old-space-size=512 --max-semi-space-size=4
       # lets the red "Clear all trace data" button (a Vega panel) open the shipper's confirmation page
       - VEGA_ENABLEEXTERNALURLS=true
     cpus: ${DASHBOARDS_CPUS:-1.0}
