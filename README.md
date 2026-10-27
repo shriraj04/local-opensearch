@@ -40,15 +40,38 @@ It starts by itself after a reboot, like the ASTRA containers do, and continues 
 
 ### Resources (hard limits)
 
-Each container has a CPU and memory ceiling, so it can never take over the laptop. Docker's log files are capped at 30 MB per container.
+Each container has a CPU and memory ceiling, so it can never take over the laptop. Docker's log files are capped at 10 MB per container.
 
 | Container | Limit | Measured |
 | --- | --- | --- |
-| `astra-opensearch` | 1.5 CPU, 1.5 GB (Java heap 768 MB) | about 0.8 to 1 GB; a few % of one CPU when idle |
-| `astra-opensearch-dashboards` | 1 CPU, 1 GB | about 215 MB; about 1% when idle |
-| `astra-log-shipper` | 0.5 CPU, 256 MB | about 17 MB, up to about 120 MB after copying very large entries (emails with attachments, up to 19 MB each); under 1% CPU when idle |
+| `astra-opensearch` | 1.5 CPU, 1 GB (Java heap 512 MB) | about 690 MB; about 1% of one CPU when idle |
+| `astra-opensearch-dashboards` | 1 CPU, 1 GB | about 120 MB; about 0% when idle |
+| `astra-log-shipper` | 0.5 CPU, 256 MB | about 25 MB, up to about 120 MB after copying very large entries (emails with attachments, up to 19 MB each) or a doctor run; under 1% CPU when idle |
 
-In total that is about 1 to 1.4 GB of RAM.
+In total that is about 0.85 GB of RAM. Before it was slimmed down (27 Oct 2026) it was about 1.3 GB, with OpenSearch at about 1 GB and 5% of one CPU when idle. How it is kept light:
+
+- **OpenSearch's Java heap is 512 MB.** The trace data needs a few tens of MB. Tested with the real data plus 19 MB email entries: 512 MB stores and searches them without refusing any; 384 MB refused each one once (the shipper retries, so nothing is lost) and 256 MB crashed. Change it with `OPENSEARCH_HEAP` in `.env`.
+- **Only Java's quick compiler** (`-XX:TieredStopAtLevel=1`): less memory and about half the idle CPU. MNG's lookups are just as fast; a few heavier operations are a little slower (see the table below).
+- **No GC log files** grow inside the OpenSearch container. JVM warnings go to Docker's capped log.
+- **Dashboards runs without its 15 bundled plugins** (alerting, anomaly detection, ML, SQL workbench, reports, security analytics, …). Each one needs an OpenSearch plugin this node does not have, and everything used here is built in: Discover, dashboards, and the Vega, markdown and metric panels. That saves about 70 MB. They are removed when the container is created; the image itself is unchanged.
+- **The home dashboard's health is updated every 30 s**, as often as the dashboard refreshes itself, instead of every 15 s.
+
+Checked before and after (27 Oct 2026), on the same real data with three 19 MB email entries added, with OpenSearch limited to 2 CPU cores and Dashboards loaded in headless Chrome (medians):
+
+| What | Before | After |
+| --- | --- | --- |
+| MNG lookups through MNG's own code (Transaction Trace, Notes, Account Trace, Internal Notes, WL-MNG trace) | 9 to 15 ms | 8 to 14 ms, identical rows |
+| Discover, 500 newest rows | 23 ms | 28 ms |
+| Visualizations (histogram and top values) | 7 ms | 7 ms |
+| Discover page with the three 19 MB entries (a 57 MB download) | 4.4 s | 4.3 s |
+| Copying entries right after a start (the re-read) | 2,800 entries/s | 3,800 entries/s |
+| Copying entries non-stop, once warmed up | up to 7,500 entries/s | about 4,500 entries/s |
+| Storing a 19 MB email entry | 2.3 to 3.6 s | 3.1 to 3.5 s, none refused |
+| Dashboards home page in Chrome, first load / again | 10.6 s / 5.7 s | 5.0 s / 3.3 s |
+| Discover in Chrome, first load / again | 9.2 s / 4.3 s | 3.5 s / 2.1 s |
+| OpenSearch memory / idle CPU | 1,010 MB / 1.9% of one CPU | 690 MB / 1.0% of one CPU |
+
+Every result was the same before and after: the MNG rows, the Discover hits and the visualization numbers. Dashboards shows the same pages, with one browser error fewer (a removed plugin called a missing API). The only visible difference is that the **Reporting** menu is gone: it needs an OpenSearch plugin this node does not have, so it never worked here.
 
 The heaviest moment is reading the whole Redis list again, after a restart for example. That is about 77,000 entries, done in about 3 seconds at about 1 CPU. Change the limits in `.env` (`OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, `OPENSEARCH_HEAP`, …) if needed.
 
@@ -150,4 +173,4 @@ Notes on reading the screens:
 
 ## Settings
 
-Copy `.env.example` to `.env` to change ports, the OpenSearch version, memory (`OPENSEARCH_HEAP`, default `768m`; CPU/memory caps `OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, …) the ASTRA checkout (`ASTRA_REPO`, default `~/payment_system`), how many days to keep (`RETENTION_DAYS`), the free-disk limit (`DISK_MIN_FREE_GB`, default `2`) or the Java for the first build (`JAVA_HOME`). Run `npm run up` afterwards.
+Copy `.env.example` to `.env` to change ports, the OpenSearch version, memory (`OPENSEARCH_HEAP`, default `512m`; CPU/memory caps `OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, …) the ASTRA checkout (`ASTRA_REPO`, default `~/payment_system`), how many days to keep (`RETENTION_DAYS`), the free-disk limit (`DISK_MIN_FREE_GB`, default `2`) or the Java for the first build (`JAVA_HOME`). Run `npm run up` afterwards.

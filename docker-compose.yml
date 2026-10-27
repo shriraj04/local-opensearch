@@ -9,7 +9,7 @@ name: astra-local-opensearch
 # Hard caps so these never spike the laptop: CPU and memory per container, and docker's own log files.
 x-logging: &logging
   driver: json-file
-  options: { max-size: "10m", max-file: "3" }
+  options: { max-size: "5m", max-file: "2" }
 
 services:
   opensearch:
@@ -25,9 +25,14 @@ services:
     container_name: astra-opensearch
     restart: unless-stopped
     environment:
-      - OPENSEARCH_JAVA_OPTS=-Xms${OPENSEARCH_HEAP:-768m} -Xmx${OPENSEARCH_HEAP:-768m}
+      # Kept light, measured with the real trace data plus 19 MB email entries (README "Resources"):
+      # - heap 512 MB: the data needs a few tens of MB; 512 MB stores and searches the 19 MB entries
+      #   without tripping a memory breaker (384 MB tripped one on each; 256 MB crashed);
+      # - TieredStopAtLevel=1: only the quick Java compiler, so less memory and half the idle CPU;
+      # - -Xlog: no GC log files growing inside the container, only JVM warnings in Docker's capped log.
+      - OPENSEARCH_JAVA_OPTS=-Xms${OPENSEARCH_HEAP:-512m} -Xmx${OPENSEARCH_HEAP:-512m} -XX:TieredStopAtLevel=1 -Xlog:disable -Xlog:all=warning:stderr
     cpus: ${OPENSEARCH_CPUS:-1.5}
-    mem_limit: ${OPENSEARCH_MEM_LIMIT:-1536m}
+    mem_limit: ${OPENSEARCH_MEM_LIMIT:-1g}
     logging: *logging
     ulimits:
       nofile: { soft: 65536, hard: 65536 }
@@ -43,6 +48,22 @@ services:
     image: opensearchproject/opensearch-dashboards:${DASHBOARDS_VERSION:-2.19.7}
     container_name: astra-opensearch-dashboards
     restart: unless-stopped
+    # Lighter: the image bundles 15 plugins (alerting, anomaly detection, ML, SQL workbench, reports,
+    # security analytics, ...) that each need an OpenSearch plugin this node does not have. They are
+    # removed before Dashboards starts (only when the container is created), so it uses about 70 MB less
+    # memory. Everything used here is built in: Discover, dashboards, Vega / markdown / metric panels.
+    # They are removed with the image's own plugin tool, by name (securityDashboards is left to the
+    # image's start script, which removes it and fixes the config with it). $$ is a literal $ here.
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        for p in alertingDashboards anomalyDetectionDashboards assistantDashboards customImportMapDashboards
+        flowFrameworkDashboards ganttChartDashboards indexManagementDashboards mlCommonsDashboards
+        notificationsDashboards observabilityDashboards queryInsightsDashboards queryWorkbenchDashboards
+        reportsDashboards searchRelevanceDashboards securityAnalyticsDashboards;
+        do [ -d "plugins/$$p" ] && ./bin/opensearch-dashboards-plugin remove "$$p"; done;
+        exec ./opensearch-dashboards-docker-entrypoint.sh opensearch-dashboards
     environment:
       - OPENSEARCH_HOSTS=["http://astra-opensearch:9200"]
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true

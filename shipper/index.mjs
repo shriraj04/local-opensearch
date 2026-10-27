@@ -27,9 +27,10 @@ export const config = {
   // Where the shipper keeps its position, so a restart (even after weeks) continues instead of re-reading
   // the whole list. Kept in OpenSearch itself: if the data is wiped, the position goes with it.
   stateIndex: env.STATE_INDEX || 'astra-shipper-state',
-  // Health for the home dashboard in OpenSearch Dashboards (one document, rewritten every 15 s).
+  // Health for the home dashboard in OpenSearch Dashboards (one document, rewritten every 30 s, as
+  // often as the dashboard refreshes itself).
   healthIndex: env.HEALTH_INDEX || 'astra-shipper-health',
-  healthEveryMs: Number(env.HEALTH_EVERY_MS || 15000),
+  healthEveryMs: Number(env.HEALTH_EVERY_MS || 30000),
   saveEveryMs: Number(env.SAVE_EVERY_MS || 2000),
   // Keep this many days of traces (today included); older daily indices are dropped by themselves.
   // n8n's crons alone write ~6,000 lines an hour, so without a limit the data keeps growing. 0 = keep all.
@@ -665,7 +666,7 @@ async function dataBytes() {
 }
 
 let lastHealthAt = 0;
-/** Writes the health document the home dashboard shows; at most every 15 s (or right away when forced). */
+/** Writes the health document the home dashboard shows; at most every 30 s (or right away when forced). */
 async function writeHealth(force = false) {
   if (!force && Date.now() - lastHealthAt < config.healthEveryMs) return;
   lastHealthAt = Date.now();

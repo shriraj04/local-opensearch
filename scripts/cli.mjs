@@ -299,6 +299,7 @@ async function prepareOpenSearchBuild() {
     if (!done) fail(`could not download ${url} with a matching sha512`);
     const unzip = run('python3', ['-I', '-c', 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])', zip, buildDir]);
     if (unzip.status !== 0) fail(`could not unpack ${zip}: ${unzip.stderr}`);
+    fs.rmSync(zip, { force: true }); // unpacked: the 55 MB zip is not needed any more
     for (const f of fs.readdirSync(path.join(distDir, 'bin'))) fs.chmodSync(path.join(distDir, 'bin', f), 0o755);
     ok(`OpenSearch ${version} downloaded and verified (sha512)`);
   }
