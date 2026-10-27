@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setupDashboards, HOME_DASHBOARD } from './dashboards.mjs';
+import { findJava, javaHelp } from './java.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dotenv = readDotEnv(path.join(ROOT, '.env'));
@@ -303,23 +304,15 @@ async function prepareOpenSearchBuild() {
   }
 
   if (!fs.existsSync(path.join(jdkDir, 'bin', 'java'))) {
-    const jdk = findJava();
-    if (!jdk) {
-      fail('No Java 17 or 21 found on this computer. Install it (sudo apt install openjdk-17-jre-headless), set JAVA_HOME, or load the ready-made image instead (see SETUP.md, "If Java will not install").');
-    }
-    const cp = run('cp', ['-rL', jdk, jdkDir]);
-    if (cp.status !== 0 && !fs.existsSync(path.join(jdkDir, 'bin', 'java'))) fail(`could not copy ${jdk}: ${cp.stderr}`);
+    const javaHome = setting('JAVA_HOME');
+    const java = findJava({ javaHome });
+    if (!java.home) fail(javaHelp({ javaHome, javaHomeProblem: java.javaHomeProblem }));
+    if (java.javaHomeProblem) warn(`JAVA_HOME (${javaHome}) ${java.javaHomeProblem}: using ${java.home} instead`);
+    const cp = run('cp', ['-rL', java.home, jdkDir]);
+    if (cp.status !== 0 && !fs.existsSync(path.join(jdkDir, 'bin', 'java'))) fail(`could not copy ${java.home}: ${cp.stderr}`);
     for (const extra of ['docs', 'man', 'jmods', 'include']) fs.rmSync(path.join(jdkDir, extra), { recursive: true, force: true });
-    ok(`Java for OpenSearch copied from ${jdk}`);
+    ok(`Java ${java.major} for OpenSearch copied from ${java.home}`);
   }
-}
-
-/** A Java 21 or 17 installed on this computer (JAVA_HOME first), or null. */
-function findJava() {
-  const jvmDirs = fs.existsSync('/usr/lib/jvm') ? fs.readdirSync('/usr/lib/jvm').map((d) => path.join('/usr/lib/jvm', d)) : [];
-  const byVersion = (v) => jvmDirs.filter((d) => new RegExp(`(^|[-.])${v}([-.]|$)`).test(path.basename(d)));
-  const candidates = [process.env.JAVA_HOME, ...byVersion(21), ...byVersion(17)].filter(Boolean);
-  return candidates.find((d) => fs.existsSync(path.join(d, 'bin', 'java')) && !fs.lstatSync(d).isSymbolicLink()) || null;
 }
 
 function sha512File(file) {
@@ -432,7 +425,8 @@ async function status({ short = false, hideWiring = false } = {}) {
       info(`Trace data: ${(size.data_bytes / 1048576).toFixed(1)} MB · keeps ${keep}${j.cleared_at ? ` (cleared ${j.cleared_at.slice(0, 16).replace('T', ' ')} UTC)` : ''} · free it now: npm run clear`);
     }
     (j.rejected ? warn : ok)(`Rejected by OpenSearch: ${fmt(j.rejected)}${j.rejected ? ' (kept in astra-shipper-rejected)' : ''}`);
-    if (j.last_error && (!j.redis.connected || !j.opensearch.reachable)) info(`last error: ${j.last_error}`);
+    const recentError = j.last_error_at && Date.now() - Date.parse(j.last_error_at) < 120_000;
+    if (j.last_error && (!j.redis.connected || !j.opensearch.reachable || (j.lag > 0 && recentError))) info(`last error: ${j.last_error}`);
   } else bad(`Shipper not reachable at ${SHIP}`);
 
   console.log('');
@@ -553,7 +547,8 @@ async function doctor() {
   const s = (await tryJson(`${SHIP}/status`))?.json;
   check(s?.redis?.connected, `reads Redis ${s?.redis?.list} (${fmt(s?.redis?.length)} entries)`, 'cannot read Redis');
   check(s && s.lag === 0, 'live: every entry in the list is shipped', `${fmt(s?.lag)} entries still waiting`);
-  if (s?.rejected) warn(`${fmt(s.rejected)} entries rejected by OpenSearch (see index astra-shipper-rejected in Dashboards)`);
+  if (s && s.lag > 0 && s.last_error) info(`last error: ${s.last_error}`);
+  if (s?.rejected) warn(`${fmt(s.rejected)} entries could not be stored (not JSON, e.g. blank lines, or refused by OpenSearch): see index astra-shipper-rejected in Dashboards`);
 
   // Sample entries straight from Redis and find each one in OpenSearch.
   const len = Number(run('docker', ['exec', 'nps_redis', 'redis-cli', 'LLEN', 'nps-logs']).stdout.trim());
@@ -587,11 +582,12 @@ async function doctor() {
     if (!par || par.missing_in_opensearch === 0) break;
     await sleep(2000);
   }
+  const rejectedNote = par?.rejected_entries ? `; the ${fmt(par.rejected_entries)} that could not be stored are in astra-shipper-rejected` : '';
   check(
     par && par.missing_in_opensearch === 0,
-    par && par.kept_entries !== par.redis_entries
-      ? `exact check: all ${fmt(par.kept_entries)} entries kept (the newer part of the ${fmt(par.redis_entries)} in Redis) are in OpenSearch, each once`
-      : `exact check: all ${fmt(par?.redis_entries)} Redis entries are in OpenSearch, each once`,
+    par && par.kept_entries + (par.rejected_entries || 0) !== par.redis_entries
+      ? `exact check: all ${fmt(par.kept_entries)} entries kept (the newer part of the ${fmt(par.redis_entries)} in Redis) are in OpenSearch, each once${rejectedNote}`
+      : `exact check: all ${fmt(par?.kept_entries)} Redis entries are in OpenSearch, each once${rejectedNote}`,
     par ? `${fmt(par.missing_in_opensearch)} Redis entries are not in OpenSearch` : 'exact check could not run (shipper not reachable)',
   );
   if (par?.not_in_redis) warn(`${fmt(par.not_in_redis)} documents are no longer in the Redis list (kept history after Redis was trimmed or flushed, or a duplicate): ${SHIP}/api/parity`);
@@ -758,11 +754,13 @@ function setupChecks() {
   const image = `astra-opensearch:${setting('OPENSEARCH_VERSION', '2.19.6')}-local`;
   const haveImage = dockerOk && run('docker', ['image', 'inspect', image]).status === 0;
   const haveBuild = fs.existsSync(path.join(ROOT, 'opensearch', 'build', 'jdk', 'bin', 'java'));
-  const java = findJava();
+  // Java is only needed to build the image the first time; look for one only then.
+  const javaHome = setting('JAVA_HOME');
+  const java = haveImage || haveBuild ? null : findJava({ javaHome });
   add(
-    haveImage || haveBuild || Boolean(java),
-    haveImage ? 'OpenSearch image is already here' : java ? `Java found (${java})` : 'Java 17 or 21 is installed',
-    'Install Java: sudo apt install openjdk-17-jre-headless — or, if that download is blocked, get the ready-made image file from Shriraj and run: docker load -i astra-opensearch-image.tar.gz',
+    haveImage || haveBuild || Boolean(java?.home),
+    haveImage ? 'OpenSearch image is already here' : haveBuild ? 'Java for OpenSearch is already copied' : java?.home ? `Java ${java.major} found (${java.home})` : 'A Java 17 to 21 is on this computer',
+    javaHelp({ javaHome, javaHomeProblem: java?.javaHomeProblem }),
   );
   for (const [port, name] of [[OS_PORT, 'OPENSEARCH_PORT'], [DASH_PORT, 'DASHBOARDS_PORT'], [SHIP_PORT, 'SHIPPER_PORT']]) {
     const users = dockerOk ? run('docker', ['ps', '--filter', `publish=${port}`, '--format', '{{.Names}}']).stdout.trim().split('\n').filter(Boolean) : [];
@@ -831,7 +829,7 @@ async function setup() {
   const missing = checks.filter((c) => !c.pass);
   if (missing.length) {
     console.log('\nPlease fix these first, then run  npm run setup  again:\n');
-    missing.forEach((c, i) => console.log(`  ${i + 1}. ${c.fix}`));
+    missing.forEach((c, i) => console.log(`  ${i + 1}. ${c.fix.split("\n").join("\n     ")}`));
     process.exit(1);
   }
 

@@ -7,10 +7,16 @@ description: Set up, update, check, connect (wire) or disconnect (unwire) Local 
 
 Local OpenSearch copies every log line the local ASTRA apps write to Redis `nps-logs` into a local OpenSearch, the way remote `nps-app-*` (mnops.cdmx.io) is filled. MNG and WL-MNG then read their trace and notes screens from it.
 
-- **Containers:** `astra-opensearch`, `astra-opensearch-dashboards`, `astra-log-shipper`. They are capped at about 1 GB of RAM in total and use almost no CPU when idle.
+- **Containers:** `astra-opensearch`, `astra-opensearch-dashboards`, `astra-log-shipper`. They are capped, use about 1 to 1.4 GB of RAM in total and almost no CPU when idle, and OpenSearch pauses writing when less than 2 GB of disk is free.
 - **Commands:** everything is driven by `npm run <command>` inside the repo folder.
 
-**Repo folder:** `~/payment_system/local-opensearch` (a separate git repo inside the payment_system folder, like `qa-astra`). Below it is called `$LOS`.
+**Repo folder (`$LOS`):** the folder this skill comes from, since this file is `$LOS/.claude/skills/local-opensearch/SKILL.md`. If the skill was loaded through the link in `~/.claude/skills`, resolve it:
+
+```bash
+LOS=$(cd "$(dirname "$(readlink -f ~/.claude/skills/local-opensearch/SKILL.md)")/../../.." && pwd)
+```
+
+With no copy yet, it is `~/payment_system/local-opensearch` (a separate git repo inside the payment_system folder, like `qa-astra`). A copy in any other folder works too: the tool then uses `~/payment_system`, or `ASTRA_REPO` in `$LOS/.env`.
 
 ## Rules (always)
 
@@ -35,25 +41,25 @@ Do all steps without stopping, unless a step says to ask. Then report as in "Rep
    ```bash
    cd ~/payment_system && git clone git@github.com:shriraj04/local-opensearch.git
    ```
-   If it fails with "Permission denied" or "Repository not found", stop: they need access from Shriraj (and a GitHub SSH key). If `$LOS` already exists, run `git -C ~/payment_system/local-opensearch pull --ff-only`. If that pull is refused (local edits, or a local commit), don't force, stash or reset anything. Continue with the version they have, and tell them in the report.
-3. **Keep it out of the payment_system repo** (safe to repeat):
+   If it fails with "Permission denied" or "Repository not found", stop: they need access from Shriraj (and a GitHub SSH key). If `$LOS` already exists, run `git -C "$LOS" pull --ff-only`. If that pull is refused (local edits, or a local commit), don't force, stash or reset anything. Continue with the version they have, and tell them in the report.
+3. **Keep it out of the payment_system repo** (only when `$LOS` is inside payment_system; safe to repeat):
    ```bash
    X=~/payment_system/.git/info/exclude; grep -qx 'local-opensearch/' "$X" || { [ -s "$X" ] && [ -n "$(tail -c1 "$X")" ] && echo >> "$X"; echo 'local-opensearch/' >> "$X"; }
    ```
    If their checkout is not at `~/payment_system`, use their path everywhere. When `$LOS` sits inside the checkout, the tool finds it by itself.
 4. **Install and start everything, connect MNG, and test it:**
    ```bash
-   cd ~/payment_system/local-opensearch && npm run setup -- --yes
+   cd "$LOS" && npm run setup -- --yes
    ```
    `--yes` connects MNG and WL-MNG (step 3 of the setup). The user's request to set it up is the consent; only if they said not to touch MNG, run `npm run setup` without `--yes`.
    - Setup prints a ✓/✗ checklist first. For each ✗, do what its line says, then run the command again.
      - A busy port: `echo "OPENSEARCH_PORT=9201" >> .env`.
-     - **"Java 17 or 21 is installed" ✗:** installing Java needs their password, so ask them to run `! sudo apt install -y openjdk-17-jre-headless` in this chat. If that download is blocked, they can get the ready-made image file from Shriraj and run `docker load -i astra-opensearch-image.tar.gz`; after that, Java is not needed.
+     - **"A Java 17 to 21 is on this computer" ✗:** setup already looked in `JAVA_HOME`, `/usr/lib/jvm` and the Testsigma agent (`~/.testsigma/agent/jre`). If they have a Java 17 to 21 elsewhere, put its folder in `$LOS/.env` as `JAVA_HOME=…` and rerun (no sudo needed). If they have sudo, they can run `! sudo apt install -y openjdk-17-jre-headless` in this chat. Otherwise, or if that download is blocked, they get the ready-made image file from Shriraj and run `docker load -i astra-opensearch-image.tar.gz`; after that, Java is not needed. Never download a Java around the office gateway (rule 6).
    - Setup also turns on the **background check**: a systemd *user* timer, `local-opensearch-guard`, that runs at login and every 10 minutes and repairs a removed container or a lost network. It uses no sudo, and its log is `journalctl --user -u local-opensearch-guard`.
 5. **Confirm** with `npm run doctor`. It must end with `✓ All good: local traces work end to end.` If a ✗ remains, follow "Fix problems".
 6. **Make this skill available in every future session:**
    ```bash
-   L=~/.claude/skills/local-opensearch; mkdir -p ~/.claude/skills; if [ -e "$L" ] && [ ! -L "$L" ]; then echo "$L already exists as a folder: left as is"; else ln -sfn ~/payment_system/local-opensearch/.claude/skills/local-opensearch "$L"; fi
+   L=~/.claude/skills/local-opensearch; mkdir -p ~/.claude/skills; if [ -e "$L" ] && [ ! -L "$L" ]; then echo "$L already exists as a folder: left as is"; else ln -sfn "$LOS/.claude/skills/local-opensearch" "$L"; fi
    ```
 
 ### Report back (plain English, short)
@@ -69,7 +75,7 @@ Do all steps without stopping, unless a step says to ask. Then report as in "Rep
 
 ## Other requests
 
-Run these from `~/payment_system/local-opensearch`.
+Run these from `$LOS`.
 
 | The user asks to… | Run | Tell them |
 | --- | --- | --- |
@@ -93,7 +99,9 @@ Run these from `~/payment_system/local-opensearch`.
 | Setup ✗ "Your local ASTRA stack is running" | They start their ASTRA stack; then rerun setup. |
 | Setup ✗ "payment_system folder is found" | `echo "ASTRA_REPO=/their/path/payment_system" > .env`, rerun. |
 | ✗ Port … is free | Do what that line says (a new port in `.env`), rerun. |
-| `No Java 17 or 21 found` | Step 1 (Java). |
+| `No Java 17 to 21 found` | Step 4, the Java ✗. |
+| Entries waiting, "paused writing because the disk is nearly full" | Less than 2 GB of disk is free (`DISK_MIN_FREE_GB`). They free disk space, or run `npm run clear -- --yes` after they confirm. Nothing is lost: shipping resumes by itself. |
+| doctor: "N entries could not be stored" (a `!` line) | Not a fault: entries that are not JSON (e.g. blank lines some writer pushes) or that OpenSearch refused. They are kept in `astra-shipper-rejected`. |
 | Image download keeps failing ("unexpected EOF", stops at the same point) | The office gateway is cutting it. Retry once. If it still fails, ask Shriraj for the ready-made image (`docker load -i …`). Do not try to get around the gateway. |
 | MNG trace / notes screen shows an error | `npm run status`: containers ✓ and `mng: wired`? If not wired → `npm run wire`; if containers ✗ → `npm run up`. |
 | New log rows don't appear in MNG | `npm run status` should say "Shipper: live". Otherwise `npm run logs`. Rows normally appear within about 2 s. |
@@ -104,6 +112,7 @@ Run these from `~/payment_system/local-opensearch`.
 ## How it works (only if asked)
 
 - **Retention:** it keeps the last 5 days (`RETENTION_DAYS`) in daily indices `nps-app-YYYY.MM.DD`, and drops older days by itself.
+- **Disk protection:** below 2 GB free (`DISK_MIN_FREE_GB`), OpenSearch pauses writing; the shipper retries and resumes by itself. The shipper sets this at start-up, so no OpenSearch rebuild is needed to change it.
 - **The shipper:** it tails `nps-logs` read-only, in one atomic `EVAL_RO` step per poll. The list grows at both ends (portals add at the end, n8n at the front). Each entry goes, unchanged plus `@timestamp`, into daily `nps-app-YYYY.MM.DD` indices, with the same field types as remote (strings are `keyword`).
 - **OpenSearch** is built locally from the official no-Java OpenSearch 2.19.6 plus the laptop's own Java, because the office gateway blocks the Java runtime inside the official image.
 - **Details:** README.md, SETUP.md and QUICK-SETUP.md in `$LOS`.

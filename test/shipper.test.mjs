@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { toDocument, docId, CopyCounter, dayIndex, retentionCutoff, tooOld } from '../shipper/index.mjs';
+import { toDocument, docId, CopyCounter, dayIndex, retentionCutoff, tooOld, diskSettings } from '../shipper/index.mjs';
 import { makeParser, LOOKUPS } from '../shipper/mng-query.mjs';
 
 const cfg = { indexPrefix: 'nps-app-', liveWindowMs: 5000 };
@@ -45,7 +45,23 @@ test('an entry that already has @timestamp keeps it', () => {
   assert.equal(JSON.parse(toDocument(raw, NOW, cfg).body)['@timestamp'], '2026-01-01T00:00:00Z');
 });
 
+test('disk protection: OpenSearch pauses writes below N GB free (free space, not a percentage), 0 = off', () => {
+  const k = (s) => `cluster.routing.allocation.disk.${s}`;
+  assert.deepEqual(diskSettings(2), {
+    [k('threshold_enabled')]: true,
+    [k('watermark.low')]: '4gb',
+    [k('watermark.high')]: '3gb',
+    [k('watermark.flood_stage')]: '2gb',
+  });
+  for (const off of [0, -1, NaN]) {
+    const s = diskSettings(off);
+    assert.equal(s[k('threshold_enabled')], false);
+    assert.equal(s[k('watermark.flood_stage')], null, 'back to the default when off');
+  }
+});
+
 test('empty object, non-JSON and non-object entries', () => {
+  assert.equal(toDocument('\n\n\n', NOW, cfg).ok, false, 'blank lines (seen in nps-logs) are not a document');
   assert.equal(JSON.parse(toDocument('{}', NOW, cfg).body)['@timestamp'], new Date(NOW).toISOString());
   assert.equal(toDocument('', NOW, cfg).ok, false);
   assert.equal(toDocument('not json', NOW, cfg).ok, false);

@@ -53,6 +53,14 @@ services:
     cpus: ${DASHBOARDS_CPUS:-1.0}
     mem_limit: ${DASHBOARDS_MEM_LIMIT:-1g}
     logging: *logging
+    # "Does the Dashboards server answer?" (not "is OpenSearch green"), so the background check
+    # (npm run ensure) repairs a hung Dashboards, without restarting it when OpenSearch has a bad moment.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s --max-time 10 http://127.0.0.1:5601/api/status | grep -q overall"]
+      interval: 30s
+      timeout: 15s
+      start_period: 180s
+      retries: 5
     ports:
       - "127.0.0.1:${DASHBOARDS_PORT:-5601}:5601"
     networks: [nps]
@@ -72,6 +80,7 @@ services:
       - NODE_OPTIONS=--max-old-space-size=192
       - POLL_MS=400
       - RETENTION_DAYS=${RETENTION_DAYS:-5}
+      - DISK_MIN_FREE_GB=${DISK_MIN_FREE_GB:-2}
       - REDIS_HOST=${REDIS_HOST:-nps_redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
       - REDIS_DB=${REDIS_DB:-0}

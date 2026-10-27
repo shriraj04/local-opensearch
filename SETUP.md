@@ -21,7 +21,7 @@ It takes about 10 minutes, once.
 | Your local ASTRA stack running | `docker ps` lists `nps_redis`, `nps_admin_web`, `nps_wl-mng_web` | Start your local ASTRA stack first |
 | Docker with Compose | `docker compose version` | Install Docker Engine |
 | Node 20 or later | `node -v` | Install Node 20 (nvm or apt) |
-| Java 17 or 21 | `java -version` | `sudo apt install openjdk-17-jre-headless`. If the download is blocked, see "If Java will not install" below. |
+| A Java 17 to 21 (first setup only) | `npm run setup` finds it | Usually nothing to do, and no sudo needed: setup also finds the Java 21 inside the Testsigma agent. Otherwise see "If Java will not install" below. |
 | Access to the repo | You can open https://github.com/shriraj04/local-opensearch | Ask Shriraj to add you |
 
 ## Steps
@@ -75,7 +75,7 @@ That's it. It starts by itself when your laptop starts, even after weeks off, an
 
 | You see | Do this |
 | --- | --- |
-| `No Java 17 or 21 found` | Install Java (table above), or see "If Java will not install". |
+| `No Java 17 to 21 found` | See "If Java will not install". |
 | `port 9200 is already used` (or 5601 / 9700) | Add another port to `.env`, e.g. `OPENSEARCH_PORT=9201`, then `npm run up`. |
 | `… not found. Put the path of your payment_system checkout in .env` | Step 2. |
 | doctor: `mng: not wired` | `npm run wire` |
@@ -85,7 +85,14 @@ That's it. It starts by itself when your laptop starts, even after weeks off, an
 
 ### If Java will not install
 
-The office web gateway can block Java downloads. Ask Shriraj for the ready-made OpenSearch image file, then load it:
+No sudo is needed. Setup finds a Java 17 to 21 by itself in `JAVA_HOME`, in `/usr/lib/jvm` and in the Testsigma agent (`~/.testsigma/agent/jre`, Java 21). If yours is somewhere else, put its folder in `.env` and run setup again:
+
+```bash
+echo "JAVA_HOME=/path/to/your/jre" >> .env
+npm run setup
+```
+
+Java 22 or newer does not work with OpenSearch 2.x, and setup says so. If there is no usable Java at all, and installing one is not possible (no sudo, or the office web gateway blocks the download), ask Shriraj for the ready-made OpenSearch image file, then load it:
 
 ```bash
 docker load -i astra-opensearch-image.tar.gz
@@ -98,4 +105,4 @@ npm run up
 
 ## Resources
 
-It is capped so it cannot slow your laptop down. In total it is about 1 GB of RAM and under 2% CPU when idle; README → "Resources" has the details.
+It is capped so it cannot slow your laptop down. In total it is about 1 to 1.4 GB of RAM and almost no CPU when idle, and OpenSearch pauses writing when less than 2 GB of disk is free; README → "Resources" has the details.

@@ -34,6 +34,7 @@ const KEY = 'nps-logs';
 const store = new Map();
 let creates = 0;
 let conflicts = 0;
+let refuseRejected = 0; // > 0: the next writes to the rejected index are refused (disk nearly full)
 globalThis.fetch = async (url, init = {}) => {
   const u = new URL(url);
   let body = { acknowledged: true };
@@ -44,7 +45,11 @@ globalThis.fetch = async (url, init = {}) => {
     for (let i = 0; i < lines.length; i += 2) {
       const action = JSON.parse(lines[i]);
       const { _id: id, _index: index } = action.create || action.index;
-      if (store.has(id)) {
+      if (index === 'astra-shipper-rejected' && refuseRejected > 0) {
+        refuseRejected -= 1;
+        const reason = `index [${index}] blocked by: [TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark, index has read-only-allow-delete block];`;
+        items.push({ index: { status: 429, error: { type: 'cluster_block_exception', reason } } });
+      } else if (store.has(id)) {
         conflicts += 1;
         items.push({ create: { status: 409 } });
       } else {
@@ -55,7 +60,11 @@ globalThis.fetch = async (url, init = {}) => {
     }
     body = { items };
   } else if (u.pathname.endsWith('/_search') && u.search.includes('scroll')) {
-    body = { _scroll_id: 's', hits: { hits: [...store.keys()].map((id) => ({ _id: id, _index: store.get(id), _source: {} })) } };
+    // only the documents of the index (pattern) searched, e.g. nps-app-* or astra-shipper-rejected
+    const pattern = decodeURIComponent(u.pathname.split('/')[1]);
+    const re = new RegExp(`^${pattern.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`);
+    const hits = [...store].filter(([, index]) => re.test(index)).map(([id, index]) => ({ _id: id, _index: index, _source: {} }));
+    body = { _scroll_id: 's', hits: { hits } };
   } else if (u.pathname.startsWith('/_cat/indices')) {
     body = [...new Set(store.values())].map((index) => ({ index, 'store.size': '1000' }));
   } else if ((init.method || 'GET') === 'DELETE' && /^\/nps-app-|^\/astra-shipper-rejected$/.test(u.pathname)) {
@@ -167,6 +176,30 @@ test('entries older than the retention are not shipped, and the exact check agre
   const p = await parity();
   assert.equal(p.missing_in_opensearch, 0);
   assert.equal(p.not_in_redis, 0);
+});
+
+test('blank and non-JSON entries are recorded as rejected, and the exact check does not count them as missing', { skip }, async () => {
+  await reset([entry(1, 'a'), '\n\n\n', '\n\n\n', 'not json', entry(2, 'b')]);
+  await drain();
+  const inIndex = (ix) => [...store.values()].filter((i) => i === ix).length;
+  assert.equal(inIndex('astra-shipper-rejected'), 3);
+  const p = await parity();
+  assert.equal(p.missing_in_opensearch, 0);
+  assert.equal(p.rejected_entries, 3);
+  assert.equal(p.kept_entries, 2);
+  assert.equal(p.not_in_redis, 0);
+});
+
+test('a rejected entry that cannot be recorded yet (disk nearly full) is retried, not dropped', { skip }, async () => {
+  await reset([entry(1, 'a'), 'not json', entry(2, 'b')]);
+  refuseRejected = 1;
+  await assert.rejects(drain(), /busy: it paused writing because the disk is nearly full/);
+  assert.equal(refuseRejected, 0);
+  await drain();
+  assert.equal([...store.values()].filter((i) => i === 'astra-shipper-rejected').length, 1);
+  const p = await parity();
+  assert.equal(p.missing_in_opensearch, 0);
+  assert.equal(p.rejected_entries, 1);
 });
 
 test('older days are removed by themselves (daily indices)', { skip }, async () => {

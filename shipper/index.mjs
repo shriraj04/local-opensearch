@@ -34,6 +34,8 @@ export const config = {
   // Keep this many days of traces (today included); older daily indices are dropped by themselves.
   // n8n's crons alone write ~6,000 lines an hour, so without a limit the data keeps growing. 0 = keep all.
   retentionDays: Number(env.RETENTION_DAYS ?? 5),
+  // Below this much free disk OpenSearch pauses writes, instead of filling the laptop (see diskSettings). 0 = off.
+  diskMinFreeGb: Number(env.DISK_MIN_FREE_GB ?? 2),
   templateName: 'nps-app',
   batchSize: Number(env.BATCH_SIZE || 500),
   maxBatchBytes: Number(env.MAX_BATCH_BYTES || 8 * 1024 * 1024),
@@ -182,7 +184,29 @@ async function os(method, urlPath, body, contentType = 'application/json') {
   return { status: res.status, json, text };
 }
 
+/**
+ * Disk protection as free space left, not as a percentage: a laptop disk that is 80-90 % full but still has
+ * many GB free never trips it, while a really full one is protected. Below `gb` free, OpenSearch pauses
+ * writes (HTTP 429, read-only-allow-delete); the shipper retries and the entries wait in Redis, old days can
+ * still be dropped, and writes resume by themselves once there is space again. Set here at start-up, not in
+ * opensearch.yml (which turns the check off), so changing it never needs an OpenSearch rebuild. 0 = off.
+ */
+export function diskSettings(gb = config.diskMinFreeGb) {
+  const key = (k) => `cluster.routing.allocation.disk.${k}`;
+  if (!(gb > 0)) {
+    return { [key('threshold_enabled')]: false, [key('watermark.low')]: null, [key('watermark.high')]: null, [key('watermark.flood_stage')]: null };
+  }
+  return {
+    [key('threshold_enabled')]: true,
+    [key('watermark.low')]: `${gb + 2}gb`,
+    [key('watermark.high')]: `${gb + 1}gb`,
+    [key('watermark.flood_stage')]: `${gb}gb`,
+  };
+}
+
 async function ensureIndexSetup() {
+  const disk = await os('PUT', '/_cluster/settings', JSON.stringify({ persistent: diskSettings() }));
+  if (disk.status !== 200) noteError(`disk protection not set (${disk.status}): ${disk.text.slice(0, 200)}`);
   for (const [name, file] of [
     [config.templateName, 'index-template.json'],
     [`${config.templateName}-fallback`, 'index-template-fallback.json'],
@@ -358,6 +382,17 @@ async function resume() {
 
 // ---------- one batch ----------
 
+/** A bulk item OpenSearch may accept later: busy (429), failing (5xx) or blocked (e.g. the disk is nearly full). */
+const retryable = (r) => r.status === 429 || r.status >= 500 || r.error?.type === 'cluster_block_exception';
+const diskFull = (r) => /flood-stage|disk usage/.test(r.error?.reason || '');
+function busyError(items, what) {
+  return new Error(
+    items.some(diskFull)
+      ? `OpenSearch is busy: it paused writing because the disk is nearly full (less than ${config.diskMinFreeGb} GB free). Free some disk space or run: npm run clear. Shipping resumes by itself.`
+      : `OpenSearch is busy (429/5xx ${what}); retrying the batch`,
+  );
+}
+
 async function shipBatch(entries, listIndexOf) {
   const now = Date.now();
   const cutoff = effectiveCutoff(now);
@@ -396,7 +431,7 @@ async function shipBatch(entries, listIndexOf) {
     if (res.status !== 200 || !res.json) {
       throw new Error(`bulk request failed (${res.status}): ${res.text.slice(0, 300)}`);
     }
-    let retry = false;
+    const busy = [];
     const refused = { lines: [], meta: [] };
     res.json.items.forEach((item, i) => {
       const r = item.create;
@@ -405,14 +440,14 @@ async function shipBatch(entries, listIndexOf) {
         state.created += 1;
         if (target === 'fallback') state.fallback += 1;
       } else if (r.status === 409) state.alreadyThere += 1;
-      else if (r.status === 429 || r.status >= 500) retry = true;
+      else if (retryable(r)) busy.push(r);
       else if (target === 'primary') {
         const index = `${m.index}-fallback`;
         refused.lines.push(JSON.stringify({ create: { _index: index, _id: m.id } }), pending.lines[i * 2 + 1]);
         refused.meta.push({ ...m, index, firstReason: JSON.stringify(r.error || r) });
       } else rejects.push({ ...m, reason: `${m.firstReason} | fallback: ${JSON.stringify(r.error || r)}` });
     });
-    if (retry) throw new Error('OpenSearch is busy (429/5xx on some entries); retrying the batch');
+    if (busy.length) throw busyError(busy, 'on some entries');
     pending = refused.lines.length ? refused : null;
   }
 
@@ -434,7 +469,11 @@ async function shipBatch(entries, listIndexOf) {
       log(`rejected entry #${r.listIndex}: ${r.reason.slice(0, 200)}`);
     }
     const dead = await os('POST', '/_bulk', `${deadLines.join('\n')}\n`, 'application/x-ndjson');
-    if (dead.status !== 200) throw new Error(`could not record rejected entries (${dead.status})`);
+    if (dead.status !== 200 || !dead.json) throw new Error(`could not record rejected entries (${dead.status})`);
+    // An entry refused here would be lost (it is in no index), so retry the batch while OpenSearch is busy or blocked.
+    const failed = (dead.json.items || []).map((item) => Object.values(item)[0]).filter((r) => r && r.status >= 300);
+    if (failed.some(retryable)) throw busyError(failed.filter(retryable), 'while recording rejected entries');
+    if (failed.length) noteError(`could not record ${failed.length} rejected entries: ${JSON.stringify(failed[0].error || failed[0]).slice(0, 300)}`);
     state.rejected += rejects.length;
   }
 }
@@ -806,6 +845,16 @@ export function statusSnapshot() {
  * same atomic steps as the shipper (so entries pushed meanwhile cannot shift the walk), keeping only ids.
  * Documents not in the list are history (Redis trimmed or flushed) — or duplicates, which `sample` shows.
  */
+/** Calls fn(hit) for every document in `index` (a missing index has none). */
+async function eachHit(index, source, fn) {
+  let res = await os('POST', `/${index}/_search?scroll=1m&ignore_unavailable=true`, JSON.stringify({ size: 10000, _source: source, sort: ['_doc'] }));
+  while (res.json && res.json.hits && res.json.hits.hits.length) {
+    for (const h of res.json.hits.hits) fn(h);
+    res = await os('POST', '/_search/scroll', JSON.stringify({ scroll: '1m', scroll_id: res.json._scroll_id }));
+  }
+  if (res.json && res.json._scroll_id) await os('DELETE', '/_search/scroll', JSON.stringify({ scroll_id: res.json._scroll_id }));
+}
+
 async function parity() {
   const redis = new Redis({ host: config.redisHost, port: config.redisPort, db: config.redisDb, maxRetriesPerRequest: 2 });
   try {
@@ -831,22 +880,30 @@ async function parity() {
       }
     }
     if (!expected) throw new Error('the list kept changing under the check; try again');
+    // Entries recorded in the rejected index (not JSON, e.g. blank lines, or refused by OpenSearch) are
+    // accounted for, not missing: the doctor reports them separately.
+    let rejected = 0;
+    await eachHit(config.rejectIndex, false, (h) => {
+      if (expected.delete(h._id)) rejected += 1;
+    });
     let missing = expected.size;
     let extra = 0;
     const sample = [];
-    let res = await os('POST', `/${config.indexPrefix}*/_search?scroll=1m`, JSON.stringify({ size: 10000, _source: ['ts', 'e_event', 'e_id'], sort: ['_doc'] }));
-    while (res.json && res.json.hits && res.json.hits.hits.length) {
-      for (const h of res.json.hits.hits) {
-        if (expected.has(h._id)) missing -= 1;
-        else {
-          extra += 1;
-          if (sample.length < 5) sample.push({ _id: h._id, _index: h._index, ...h._source });
-        }
+    await eachHit(`${config.indexPrefix}*`, ['ts', 'e_event', 'e_id'], (h) => {
+      if (expected.has(h._id)) missing -= 1;
+      else {
+        extra += 1;
+        if (sample.length < 5) sample.push({ _id: h._id, _index: h._index, ...h._source });
       }
-      res = await os('POST', '/_search/scroll', JSON.stringify({ scroll: '1m', scroll_id: res.json._scroll_id }));
-    }
-    if (res.json && res.json._scroll_id) await os('DELETE', '/_search/scroll', JSON.stringify({ scroll_id: res.json._scroll_id }));
-    return { redis_entries: length, kept_entries: expected.size, missing_in_opensearch: missing, not_in_redis: extra, sample_not_in_redis: sample };
+    });
+    return {
+      redis_entries: length,
+      kept_entries: expected.size,
+      rejected_entries: rejected,
+      missing_in_opensearch: missing,
+      not_in_redis: extra,
+      sample_not_in_redis: sample,
+    };
   } finally {
     redis.disconnect();
   }

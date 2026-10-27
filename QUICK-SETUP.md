@@ -22,7 +22,7 @@ Tick these off. If one is missing, the setup will tell you what to do anyway.
 | ☐ | Your local ASTRA is running | https://qa-alpha-astramng.local opens |
 | ☐ | Docker | `docker ps` works |
 | ☐ | Node 20 or newer | `node -v` shows **v20** or higher |
-| ☐ | Java 17 | `java -version` shows **17**. If not: `sudo apt install openjdk-17-jre-headless` |
+| ☐ | A Java 17 to 21 (first setup only) | Usually nothing to do: setup finds it, including the Java 21 inside the Testsigma agent (no sudo needed). |
 | ☐ | Access to the GitHub repo | https://github.com/shriraj04/local-opensearch opens. If not, ask Shriraj. |
 
 ---
@@ -87,7 +87,7 @@ The setup does everything for you:
 | | |
 |---|---|
 | 🔁 **Starts by itself** | Restarts, weeks switched off, Redis restarts: it picks up where it stopped. A small check at login and every 10 minutes repairs anything Docker cannot. |
-| 🪶 **Light** | About 1 GB of memory and almost no CPU when idle. On disk it keeps only the **last 5 days** of traces (a few MB) and removes older days by itself. |
+| 🪶 **Light** | About 1 to 1.4 GB of memory and almost no CPU when idle. On disk it keeps only the **last 5 days** of traces (a few MB) and removes older days by itself. |
 | 🧹 **Free space now** | The red **Clear all trace data** button on the Dashboards home page, or `npm run clear` |
 | 🗑️ **Remove it completely** | `npm run remove` (asks first; frees about 2.3 GB, including the Docker images) |
 | ⬆️ **Update** | `git pull --ff-only && npm run setup` |
@@ -103,7 +103,7 @@ The setup does everything for you:
 | You see | Do this |
 |---|---|
 | A red **✗** during setup | Do what that line says, then run `npm run setup` again. |
-| `No Java 17 or 21 found` and the Java install is blocked | Ask Shriraj for the file `astra-opensearch-image.tar.gz`, then run `docker load -i astra-opensearch-image.tar.gz` and `npm run setup` again. |
+| `No Java 17 to 21 found` | If you have a Java 17 to 21 somewhere, run `echo "JAVA_HOME=/path/to/it" >> .env` and `npm run setup` again (no sudo needed). Otherwise ask Shriraj for the file `astra-opensearch-image.tar.gz`, then run `docker load -i astra-opensearch-image.tar.gz` and `npm run setup` again. |
 | `Port … is already used` | Run the command shown on that line (it picks another port), then `npm run setup` again. |
 | The trace screen in MNG shows an error | Run `npm run doctor` and follow any ✗ line. |
 | Still stuck | Send Shriraj the output of `npm run doctor`. |

@@ -32,9 +32,11 @@ echo "local-opensearch/" >> .git/info/exclude      # never commit it into paymen
 cd local-opensearch && npm run setup                # checks the laptop, starts it, connects MNG, tests it
 ```
 
-Needs Docker, Node 20+, Java 17 or 21 on this computer (found in `/usr/lib/jvm` or `JAVA_HOME`; not needed when the image is loaded ready-made, see SETUP.md), and the local ASTRA stack running (network `nps_default`, container `nps_redis`).
+Cloned it somewhere else? That works too: it then uses `~/payment_system`, or the checkout named by `ASTRA_REPO` in `.env`.
 
-It starts by itself after a reboot, like the ASTRA containers do, and continues from where it stopped; it does not re-read everything. A small background check (`npm run autostart`, which `npm run setup` turns on) runs at login and every 10 minutes and repairs anything Docker cannot, such as a removed container or a recreated `nps_default` network. `npm run down` stops it until the next `npm run up`, and the background check then leaves it alone.
+Needs Docker, Node 20+, a Java 17 to 21 on this computer for the first build (no sudo needed: it is found in `JAVA_HOME`, also from `.env`, in `/usr/lib/jvm`, or in the Testsigma agent's `~/.testsigma/agent/jre`; not needed when the image is loaded ready-made, see SETUP.md), and the local ASTRA stack running (network `nps_default`, container `nps_redis`).
+
+It starts by itself after a reboot, like the ASTRA containers do, and continues from where it stopped; it does not re-read everything. A small background check (`npm run autostart`, which `npm run setup` turns on) runs at login and every 10 minutes and repairs anything Docker cannot, such as a removed container, a recreated `nps_default` network, or a Dashboards that stopped answering. `npm run down` stops it until the next `npm run up`, and the background check then leaves it alone.
 
 ### Resources (hard limits)
 
@@ -42,9 +44,11 @@ Each container has a CPU and memory ceiling, so it can never take over the lapto
 
 | Container | Limit | Measured |
 | --- | --- | --- |
-| `astra-opensearch` | 1.5 CPU, 1.5 GB (Java heap 768 MB) | about 830 MB; under 2% CPU when idle |
-| `astra-opensearch-dashboards` | 1 CPU, 1 GB | about 215 MB; about 0% when idle |
-| `astra-log-shipper` | 0.5 CPU, 256 MB | about 17 MB; under 1% CPU when idle |
+| `astra-opensearch` | 1.5 CPU, 1.5 GB (Java heap 768 MB) | about 0.8 to 1 GB; a few % of one CPU when idle |
+| `astra-opensearch-dashboards` | 1 CPU, 1 GB | about 215 MB; about 1% when idle |
+| `astra-log-shipper` | 0.5 CPU, 256 MB | about 17 MB, up to about 120 MB after copying very large entries (emails with attachments, up to 19 MB each); under 1% CPU when idle |
+
+In total that is about 1 to 1.4 GB of RAM.
 
 The heaviest moment is reading the whole Redis list again, after a restart for example. That is about 77,000 entries, done in about 3 seconds at about 1 CPU. Change the limits in `.env` (`OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, `OPENSEARCH_HEAP`, …) if needed.
 
@@ -53,6 +57,7 @@ The heaviest moment is reading the whole Redis list again, after a restart for e
 Each log line takes about 250 bytes. n8n's scheduled jobs alone write about 6,000 lines an hour (the processor-status cron writes about 1,000 lines every 10 minutes). So the shipper keeps only the **last 5 days** (today plus the 4 days before) and removes older days by itself, which is usually a few MB in total. Change it with `RETENTION_DAYS` in `.env` (`0` = keep everything), then run `npm run up`.
 
 - **Free space right now:** the red **Clear all trace data** button on the Dashboards home page, or `npm run clear`. It deletes all trace data at once; new log lines keep coming in, and nothing old comes back from Redis.
+- **When the disk is nearly full:** below 2 GB free, OpenSearch pauses writing instead of filling the laptop. Nothing is lost: the shipper retries and the entries wait in Redis, and `npm run status` says why entries are waiting. Writing resumes by itself once there is space again (`npm run clear` frees it at once). Change the limit with `DISK_MIN_FREE_GB` in `.env` (`0` = off). The shipper sets it when it starts, so changing it needs no OpenSearch rebuild.
 - **Remove everything** (data, containers, background check and the Docker images, about 2.3 GB, the biggest part): `npm run remove`. It asks first, and also puts MNG's original config back.
 
 These lines appear even when nobody is logged in: n8n's crons run all the time, and every MNG page request (even the login page) is logged with `uid 0`.
@@ -62,7 +67,7 @@ These lines appear even when nobody is logged in: n8n's crons run all the time, 
 The office web gateway (Cloudflare WARP) cuts the download of the Java runtime bundled inside the official OpenSearch image and tarballs. The download always stops in `jdk/jmods/java.base.jmod`. So `npm run up` instead builds the image from:
 
 - the official **no-JDK** OpenSearch distribution from Maven Central (`org.opensearch.distribution.integ-test-zip`, 2.19.6), checked against its sha512 (and its PGP signature, which is good), and
-- the Java 17 that is already installed on this computer.
+- a Java 17 to 21 that is already on this computer (a system one, `JAVA_HOME`, or the Java 21 inside the Testsigma agent), copied into the image.
 
 It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN, …) are not included; nothing here uses them. On a network without that gateway, the official image would also work.
 
@@ -73,17 +78,17 @@ It is the same OpenSearch engine. The bundled plugins (security, alerting, k-NN,
 | `npm run setup` | First-time setup in one go: checks the laptop (each ✗ says how to fix it), starts everything, asks before connecting MNG / WL-MNG, then runs the doctor. Safe to run again. |
 | `npm run up` | Starts OpenSearch, Dashboards and the log shipper (or updates them), waits until everything in Redis is copied, and sets up Dashboards. Safe to run again. |
 | `npm run status` | Whether everything is running, how many entries are copied, and whether MNG is wired. |
-| `npm run doctor` | Full check. It finds entries sampled from Redis in OpenSearch, checks that MNG can reach OpenSearch, and runs the Transaction Trace query with **MNG's own code inside the MNG container**, comparing the result with the same query run by the shipper. |
+| `npm run doctor` | Full check. It finds entries sampled from Redis in OpenSearch, checks that MNG can reach OpenSearch, and runs the Transaction Trace query with **MNG's own code inside the MNG container**, comparing the result with the same query run by the shipper. Entries that could not be stored (not JSON, or refused by OpenSearch) are listed on a `!` line, not counted as missing. |
 | `npm run wire` | Sets `OPS_URL` in `mng/app/config/config.json` and `wl-mng/app/config/config.json` to `http://astra-opensearch:9200`. Nothing else in those files changes. The original files are saved in `~/.config/astra-local/opensearch-wiring/`. The portals restart by themselves. |
 | `npm run unwire` | Puts the original files back byte for byte. If someone edited a file since, only `OPS_URL` is put back and their edits are kept. |
 | `npm run trace -- tx 189444` | Transaction Trace for a transaction, in the terminal. Also `notes 189444`, `account 140`, `internal-notes 2026-10-01 2026-10-23`, `wl-trace 189444`. |
 | `npm run logs` | The shipper's own output. Use `npm run logs -- opensearch` or `-- dashboards` for the others, and add `-- -f` to keep following. |
 | `npm run down` | Stops the containers. The data is kept, and it stays stopped (also after a reboot) until `npm run up`. |
-| `npm run autostart` / `autostart:off` | Turns the background check on or off: at login and every 10 minutes it repairs a removed container or a lost network. Its log: `journalctl --user -u local-opensearch-guard`. |
+| `npm run autostart` / `autostart:off` | Turns the background check on or off: at login and every 10 minutes it repairs a removed container, a lost network or a Dashboards that stopped answering. Its log: `journalctl --user -u local-opensearch-guard`. |
 | `npm run ensure` | Runs that check once, now. |
 | `npm run clear` | Deletes all trace data now, to free disk space (the same as the red **Clear all trace data** button on the Dashboards home page). New log lines keep coming in. Older days are also removed by themselves after 5 days. |
 | `npm run remove` | Removes everything it put on the laptop: puts MNG's config back, deletes the containers, data, Docker images (about 2.3 GB) and the background check. It asks first. |
-| `npm test` | Unit tests. |
+| `npm test` | The tests: unit tests, the Java lookup, and the shipper against a throwaway Redis in Docker (removed afterwards). |
 
 ## The page
 
@@ -109,7 +114,7 @@ The shipper's own address (`127.0.0.1:9700`) is only a background API for the CL
 - **No TLS and no login on the local OpenSearch.** It is only reachable from this computer and the ASTRA containers. MNG still sends its usual user/password, which is simply ignored.
 - **`_id`:** a fixed hash of the entry rather than a random id, so a restart never creates duplicates. MNG never reads `_id`.
 - **`@timestamp`:** an entry copied as it happens gets the time it was copied, as on remote (about 0.1 s after `ts`). An entry copied late, for example when the shipper was off, gets its own `ts`.
-- **`aux`:** stored as a `flat_object`, and text longer than 8,191 characters is kept but not searchable. As a result, entries whose `aux` changes shape between writers, or that carry very large values, are never refused. On remote, such entries may be refused; any entry OpenSearch still refuses here is kept in `astra-shipper-rejected` with the reason.
+- **`aux`:** stored as a `flat_object`, and text longer than 8,191 characters is kept but not searchable. As a result, entries whose `aux` changes shape between writers, or that carry very large values, are never refused. On remote, such entries may be refused; any entry OpenSearch still refuses here is kept in `astra-shipper-rejected` with the reason. So is an entry that is not JSON at all, such as the blank lines some writer pushes into `nps-logs` now and then.
 
 **History:** the shipper copies what is in Redis `nps-logs` now, then everything new as it happens. Local logs that were never in Redis cannot be recovered.
 
@@ -138,8 +143,11 @@ Notes on reading the screens:
 2. If a trace screen in MNG shows an error, check `npm run status` for `mng: wired` and a running `astra-opensearch`.
 3. If new rows do not appear, check `npm run status` for "Shipper: live" and `npm run logs`. A row usually appears within a second.
 4. If the Redis list was flushed or replaced, the shipper notices and reads it again. What is already in OpenSearch stays.
-5. To stop using it: `npm run unwire`, then `npm run down`.
+5. If entries are waiting and the last error says OpenSearch "paused writing because the disk is nearly full", less than 2 GB of disk is free. Free some space, or run `npm run clear`. Shipping resumes by itself and nothing is lost.
+6. A doctor line like "! 40 entries could not be stored" is not a fault. Those entries are not JSON (often blank lines) or were refused by OpenSearch, and they are kept in `astra-shipper-rejected` with the reason.
+7. If setup cannot find Java, see SETUP.md, "If Java will not install". No sudo is needed when any Java 17 to 21 is already on the laptop.
+8. To stop using it: `npm run unwire`, then `npm run down`.
 
 ## Settings
 
-Copy `.env.example` to `.env` to change ports, the OpenSearch version, memory (`OPENSEARCH_HEAP`, default `768m`; CPU/memory caps `OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, …) or the ASTRA checkout (`ASTRA_REPO`, default `~/payment_system`). Run `npm run up` afterwards.
+Copy `.env.example` to `.env` to change ports, the OpenSearch version, memory (`OPENSEARCH_HEAP`, default `768m`; CPU/memory caps `OPENSEARCH_CPUS`, `OPENSEARCH_MEM_LIMIT`, …) the ASTRA checkout (`ASTRA_REPO`, default `~/payment_system`), how many days to keep (`RETENTION_DAYS`), the free-disk limit (`DISK_MIN_FREE_GB`, default `2`) or the Java for the first build (`JAVA_HOME`). Run `npm run up` afterwards.
